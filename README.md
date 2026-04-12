@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="waggle-mcp" width="720"/>
+  <img src="https://raw.githubusercontent.com/Abhigyan-Shekhar/graph-memory-mcp/main/assets/banner.png" alt="waggle-mcp" width="720"/>
 </p>
 
 <p align="center">
@@ -34,7 +34,7 @@ Most LLMs forget everything when the conversation ends.
 ## Demo
 
 <p align="center">
-  <img src="assets/demo.svg" alt="waggle-mcp init demo" width="720"/>
+  <img src="https://raw.githubusercontent.com/Abhigyan-Shekhar/graph-memory-mcp/main/assets/demo.svg" alt="waggle-mcp init demo" width="720"/>
 </p>
 
 ---
