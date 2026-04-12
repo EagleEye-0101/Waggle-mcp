@@ -27,7 +27,7 @@ Waggle's key advantage is **token efficiency with structured context**:
 | Without waggle-mcp | With waggle-mcp |
 |--------------------------|----------------------|
 | Context stuffed into a 200k-token prompt | **~4× fewer tokens** — compact subgraph, only relevant nodes retrieved |
-| "What did we decide about the DB schema?" → ❌ no idea | ✅ Recalls the decision node, when it was made, and what it contradicts |
+| "What did we decide about the DB schema?" → ❌ Lost when the session ended | ✅ Recalls the decision node, when it was made, and what it contradicts |
 | Flat bullet-list memory | Typed edges: `relates_to`, `contradicts`, `depends_on`, `updates`… |
 | One session, one agent | Multi-tenant, multi-session, multi-agent |
 
@@ -135,16 +135,10 @@ Under the hood, it:
 
 No instructions needed. No schema to define. Just observe.
 
----
+Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (with a regex fallback) to pull structured facts out of messy dialogue.
 
-## Fact Extraction Schema
+**Example:** `"Let's use PostgreSQL because MySQL replication is too painful."`
 
-When the agent observes a conversation, the backend runs a Pydantic-validated LLM extraction pass (or falls back to a regex engine) to pull structured facts out of messy dialogue.
-
-**Example Input:**
-> "Let's use PostgreSQL for the generic event storage because MySQL replication is too painful to manage."
-
-**Validated Output:**
 ```json
 {
   "facts": [
@@ -309,9 +303,9 @@ Most memory systems answer "what do you know about X?" — but can't answer
 
 ---
 
-## Unit Testing
+## Testing
 
-Beyond empirical benchmarks, `waggle-mcp` ships with a comprehensive pytest suite covering both memory logic and server protocols. This guarantees core functions like LLM extraction, multi-tenant isolation, conflict detection, semantic deduplication, and MCP protocol handling remain stable across updates.
+Beyond empirical benchmarks, `waggle-mcp` ships with a comprehensive pytest suite covering both memory logic and server protocols. This guarantees core behaviours — multi-tenant isolation, conflict detection, semantic deduplication, MCP protocol handling, and explicit LLM backend failure — remain stable across updates.
 
 <details>
 <summary>View the 43 component and integration tests (click to expand)</summary>
