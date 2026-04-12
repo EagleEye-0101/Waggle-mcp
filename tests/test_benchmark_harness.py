@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from waggle.benchmark_harness import (
+    build_markdown_summary,
     choose_best_dedup_threshold,
     load_benchmark_fixtures,
     run_benchmarks,
@@ -41,12 +42,18 @@ def test_fixture_loading_is_auditable() -> None:
     assert len(fixtures["retrieval_cases"]["nodes"]) == 8
     assert len(fixtures["retrieval_cases"]["queries"]) == 6
     assert len(fixtures["dedup_cases"]) == 6
+    assert len(fixtures["comparative_eval"]["scenarios"]) >= 20
+    assert len(fixtures["comparative_eval"]["queries"]) == 50
     assert any(not case["should_dedup"] for case in fixtures["dedup_cases"])
     assert any(case["should_dedup"] for case in fixtures["dedup_cases"])
 
 
 def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
-    report = run_benchmarks(extraction_backend="regex", embedding_model=FakeEmbeddingModel())
+    report = run_benchmarks(
+        extraction_backend="regex",
+        embedding_model=FakeEmbeddingModel(),
+        systems=["waggle", "rag_naive", "rag_tuned"],
+    )
 
     extraction = next(metric for metric in report.metrics if metric.metric == "extraction")
     retrieval = next(metric for metric in report.metrics if metric.metric == "retrieval")
@@ -60,6 +67,25 @@ def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
     assert dedup.backend == "semantic-dedup"
     assert dedup.case_count == 6
     assert "threshold" in dedup.metadata
+    assert report.comparative["corpus"]["scenario_count"] >= 20
+    assert report.comparative["corpus"]["query_count"] == 50
+    assert set(report.comparative["systems"]) == {"waggle", "rag_naive", "rag_tuned"}
+    assert len(report.comparative["per_case"]) == 150
+
+
+def test_markdown_summary_includes_comparative_systems() -> None:
+    report = run_benchmarks(
+        extraction_backend="regex",
+        embedding_model=FakeEmbeddingModel(),
+        systems=["waggle", "rag_naive"],
+    )
+
+    markdown = build_markdown_summary(report)
+
+    assert "# Waggle Comparative Evaluation" in markdown
+    assert "| waggle |" in markdown
+    assert "| rag_naive |" in markdown
+    assert "Failure Protocol" in markdown
 
 
 def test_llm_benchmark_failure_is_explicit(monkeypatch) -> None:

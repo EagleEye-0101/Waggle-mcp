@@ -176,6 +176,7 @@ Current fixture inventory:
 - **Extraction:** 12 checked-in dialogue cases covering simple recall, interruptions, reversals, vague statements, conflicting statements, and mixed user/assistant signal.
 - **Retrieval:** an 8-node benchmark corpus with 6 queries covering paraphrase and temporal phrasing.
 - **Deduplication:** 6 checked-in node pairs with both true-duplicate and false-friend cases.
+- **Comparative pilot eval:** 24 multi-session scenarios with 50 retrieval/temporal queries and gold support facts for `waggle`, `rag_naive`, and `rag_tuned`.
 
 Run the harness locally:
 
@@ -183,6 +184,7 @@ Run the harness locally:
 PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py
 PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py --extraction-backend regex
 PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py --extraction-backend llm --ollama-model qwen2.5:7b --ollama-timeout-seconds 30
+PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py --systems waggle rag_naive rag_tuned --output tests/artifacts/pilot_comparative.json
 ```
 
 Saved verification artifacts live under [`tests/artifacts`](./tests/artifacts/).
@@ -196,6 +198,15 @@ Measured results from the saved runs on this branch:
 | **LLM extraction** | `9/12 = 75%` using local Ollama `qwen2.5:7b` with `30s` request timeout |
 | **Retrieval** | `5/6 = 83%` |
 | **Deduplication** | `3/6 = 50%` |
+| **Comparative pilot corpus** | 24 scenarios / 50 queries, saved in [`tests/artifacts/pilot_comparative.json`](./tests/artifacts/pilot_comparative.json) and [`tests/artifacts/pilot_comparative.md`](./tests/artifacts/pilot_comparative.md) |
+
+Comparative pilot results on the saved corpus:
+
+| System | Hit@k | Exact support | Mean tokens | Median tokens | p95 tokens |
+|--------|-------|---------------|-------------|---------------|------------|
+| **waggle** | `92%` | `88%` | `37.2` | `38.0` | `42.0` |
+| **rag_naive** | `100%` | `100%` | `152.1` | `154.0` | `163.0` |
+| **rag_tuned** | `100%` | `100%` | `244.0` | `245.0` | `259.6` |
 
 Deduplication threshold sweep on the checked-in fixture set:
 
@@ -214,6 +225,13 @@ What these saved runs demonstrate:
 - semantic retrieval over the checked-in corpus
 - deduplication accuracy over the checked-in duplicate and non-duplicate pairs
 - an end-to-end MCP store/query demo against the live server
+- a first comparative pilot showing large context-token reduction versus chunked-vector baselines
+
+What the comparative pilot means right now:
+
+- **Waggle is materially cheaper on context tokens** than both chunked-vector baselines on the saved corpus.
+- **The current pilot corpus is still too easy for the baselines on support recall**, so these numbers do **not** yet justify a retrieval-superiority claim.
+- **The next evaluation step is corpus hardening, not more harness work**: make temporal and multi-session queries harder, improve support attribution pressure, and rerun the same command.
 
 The LLM benchmark does **not** silently fall back to regex. In the first saved attempt, two cases timed out at the extractor's original `15s` Ollama request limit and the run recorded an explicit backend-unavailable error instead of publishing substituted numbers. The stable saved run on this branch uses a configurable `30s` timeout.
 
