@@ -171,22 +171,26 @@ When the agent observes a conversation, the backend runs a Pydantic-validated LL
 
 ### Micro-Benchmarks (Adversarial Dataset)
 
-We run a localized [micro-benchmark script](./scripts/benchmark_extraction.py) evaluating a suite of 50 carefully curated, highly-adversarial dialogues (including noisy interruptions, context-switching, and conflicting statements) to rigorously test bounds:
+We are finalizing a localized [micro-benchmark script](./scripts/benchmark_extraction.py) to evaluate a suite of highly-adversarial dialogues (including noisy interruptions, context-switching, and conflicting statements) to rigorously test bounds.
+
+*(Benchmarking dataset and empirical validations are currently being compiled. Preliminary baseline scripts are available in the repo, but formal numbers will be published shortly.)*
 
 | Task | Accuracy | Notes |
 |------|----------|-------|
-| **Structured Fact Extraction** | 87% | *LLM pipeline with local Mistral model. (Regex fallback achieves ~62% baseline).* |
-| **Semantic Retrieval (Hit@5)** | 94% | *Using `all-MiniLM-L6-v2`. Hard adversarial queries drop accuracy from naive 100% to 94%.* |
-| **Node Deduplication** | 92% | *Semantic node-merging avoids duplicating the exact same knowledge.* |
+| **Structured Fact Extraction** | TBD | *Evaluating LLM extraction pipeline vs regex fallback baseline.* |
+| **Semantic Retrieval (Hit@5)** | TBD | *Evaluating using `all-MiniLM-L6-v2` against hard adversarial queries.* |
+| **Node Deduplication** | TBD | *Evaluating semantic node-merging to avoid duplicating the exact same knowledge.* |
 
 ### Waggle vs. Standard Vector RAG (Token Efficiency)
 
-Unlike naive document chunk RAG (e.g., standard LangChain/LlamaIndex document stores), Waggle explicitly extracts and compacts granular graph nodes. This provides a massive token-efficiency and context-density advantage:
+Unlike naive document chunk RAG (e.g., standard LangChain/LlamaIndex document stores), Waggle explicitly extracts and compacts granular graph nodes. This provides a massive token-efficiency and context-density advantage.
+
+*(Empirical benchmarking against LangChain VectorStore limits is currently underway.)*
 
 | System | Tokens per Prime | Retrieval Relevance | Context Window Waste |
 |--------|------------------|---------------------|----------------------|
-| **Naive Vector RAG** | ~8,500 tokens | 78% | High (entire document chunks retrieved) |
-| **Waggle Memory Graph** | **~1,200 tokens** | **89%** | **Near Zero** (only explicitly verified nodes/edges) |
+| **Naive Vector RAG** | TBD | TBD | High (entire document chunks retrieved) |
+| **Waggle Memory Graph** | **TBD** | **TBD** | **Near Zero** (only explicitly verified nodes/edges) |
 
 ### When Extraction Fails
 
