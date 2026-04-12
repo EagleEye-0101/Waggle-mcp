@@ -304,6 +304,67 @@ Most memory systems answer "what do you know about X?" — but can't answer
 
 ---
 
+## Unit Testing
+
+Beyond empirical benchmarks, `waggle-mcp` ships with a comprehensive pytest suite covering both memory logic and server protocols. This guarantees core functions like LLM extraction, multi-tenant isolation, conflict detection, semantic deduplication, and MCP protocol handling remain stable across updates.
+
+<details>
+<summary>View the 43 component and integration tests (click to expand)</summary>
+
+```text
+============================= test session starts ==============================
+collected 43 items                                                             
+
+tests/test_benchmark_harness.py::test_fixture_loading_is_auditable PASSED
+tests/test_benchmark_harness.py::test_benchmark_report_includes_backend_labels_and_case_counts PASSED
+tests/test_benchmark_harness.py::test_markdown_summary_includes_comparative_systems PASSED
+tests/test_benchmark_harness.py::test_llm_benchmark_failure_is_explicit PASSED
+tests/test_benchmark_harness.py::test_dedup_threshold_sweep_tracks_positive_and_negative_cases PASSED
+tests/test_embeddings.py::test_embedding_bytes_round_trip PASSED
+tests/test_embeddings.py::test_cosine_similarity_handles_orthogonal_vectors PASSED
+tests/test_graph.py::test_add_query_and_related PASSED
+tests/test_graph.py::test_update_delete_and_stats PASSED
+tests/test_graph.py::test_exact_duplicate_nodes_are_reused_and_tags_are_merged PASSED
+tests/test_graph.py::test_semantic_duplicate_nodes_reuse_existing_entry PASSED
+tests/test_graph.py::test_entity_resolution_reuses_acronym_matches PASSED
+tests/test_graph.py::test_query_ranking_uses_label_lexical_overlap PASSED
+tests/test_graph.py::test_decompose_and_store_creates_nodes_and_edges PASSED
+tests/test_graph.py::test_export_and_import_backup_round_trip PASSED
+tests/test_graph.py::test_export_graph_html_creates_visualization_file PASSED
+tests/test_graph.py::test_conflict_detection_creates_contradiction_edge PASSED
+tests/test_graph.py::test_observe_conversation_extracts_nodes PASSED
+tests/test_graph.py::test_query_supports_temporal_latest_and_oldest_bias PASSED
+tests/test_graph.py::test_graph_diff_and_prime_context PASSED
+tests/test_graph.py::test_get_topics_returns_clusters PASSED
+tests/test_platform.py::test_api_key_hashing_round_trip PASSED
+tests/test_platform.py::test_rate_limiter_enforces_request_and_concurrency_limits PASSED
+tests/test_platform.py::test_tenant_scoping_isolated_within_same_sqlite_database PASSED
+tests/test_platform.py::test_backup_round_trip_preserves_schema_and_tenant_metadata PASSED
+tests/test_platform.py::test_http_app_health_auth_and_metrics PASSED
+tests/test_platform.py::test_http_app_rate_limit_and_payload_limit PASSED
+tests/test_server.py::test_store_node_and_stats_tool PASSED
+tests/test_server.py::test_export_graph_html_tool PASSED
+tests/test_server.py::test_decompose_and_store_tool_persists_subgraph PASSED
+tests/test_server.py::test_export_and_import_backup_tools PASSED
+tests/test_server.py::test_store_node_reports_deduplication PASSED
+tests/test_server.py::test_store_node_reports_conflicts PASSED
+tests/test_server.py::test_observe_conversation_tool PASSED
+tests/test_server.py::test_graph_diff_prime_context_and_topics_tools PASSED
+tests/test_server.py::test_recent_resource_serialization PASSED
+tests/test_server.py::test_unknown_tool_raises PASSED
+tests/test_server.py::test_invalid_tool_inputs_return_structured_errors PASSED
+tests/test_server.py::test_tool_payload_limit_is_enforced PASSED
+tests/test_server.py::test_default_graph_uses_sqlite_backend_by_default PASSED
+tests/test_server.py::test_default_graph_can_build_neo4j_backend PASSED
+tests/test_server.py::test_default_graph_requires_neo4j_connection_settings PASSED
+tests/test_stdio_integration.py::test_server_stdio_initialize_and_basic_calls PASSED
+
+============================== 43 passed in 4.92s ==============================
+```
+</details>
+
+---
+
 ## Installation
 
 <details>

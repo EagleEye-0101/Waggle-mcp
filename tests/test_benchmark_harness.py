@@ -39,9 +39,9 @@ def test_fixture_loading_is_auditable() -> None:
     fixtures = load_benchmark_fixtures()
 
     assert len(fixtures["extraction_cases"]) == 12
-    assert len(fixtures["retrieval_cases"]["nodes"]) == 8
-    assert len(fixtures["retrieval_cases"]["queries"]) == 6
-    assert len(fixtures["dedup_cases"]) == 6
+    assert len(fixtures["retrieval_cases"]["nodes"]) == 18
+    assert len(fixtures["retrieval_cases"]["queries"]) == 18
+    assert len(fixtures["dedup_cases"]) == 22
     assert len(fixtures["comparative_eval"]["scenarios"]) >= 20
     assert len(fixtures["comparative_eval"]["queries"]) == 50
     assert any(not case["should_dedup"] for case in fixtures["dedup_cases"])
@@ -62,10 +62,10 @@ def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
     assert extraction.backend == "regex"
     assert extraction.case_count == 12
     assert retrieval.backend == "semantic-query"
-    assert retrieval.case_count == 6
+    assert retrieval.case_count == 18
     assert "corpus_nodes" in retrieval.metadata
     assert dedup.backend == "semantic-dedup"
-    assert dedup.case_count == 6
+    assert dedup.case_count == 22
     assert "threshold" in dedup.metadata
     assert report.comparative["corpus"]["scenario_count"] >= 20
     assert report.comparative["corpus"]["query_count"] == 50
@@ -110,7 +110,7 @@ def test_dedup_threshold_sweep_tracks_positive_and_negative_cases() -> None:
     )
 
     assert sweep
-    assert best.metadata["positive_cases"] == 3
-    assert best.metadata["negative_cases"] == 3
-    assert best.metadata["true_negatives"] + best.metadata["false_positives"] == 3
-    assert best.metadata["true_positives"] + best.metadata["false_negatives"] == 3
+    assert best.metadata["positive_cases"] == 11
+    assert best.metadata["negative_cases"] == 11
+    assert best.metadata["true_negatives"] + best.metadata["false_positives"] == 11
+    assert best.metadata["true_positives"] + best.metadata["false_negatives"] == 11
