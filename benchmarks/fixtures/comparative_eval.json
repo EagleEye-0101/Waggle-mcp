@@ -911,6 +911,125 @@
           "timestamp": "2026-04-12T13:35:00+00:00"
         }
       ]
+    },
+    {
+      "id": "context_assembly_decision_reason",
+      "title": "Context Assembly: Decision + Reason Co-appearance",
+      "description": "Verify that when querying a decision, supporting reasons are also returned (support coverage)",
+      "sessions": [
+        {
+          "id": "context_dec_reason_s1",
+          "timestamp": "2026-01-10T14:00:00+00:00",
+          "transcript": "User: We need PostgreSQL because ACID compliance is critical. Agent: Recorded decision to use PostgreSQL with ACID requirements.",
+          "support_fact_ids": [
+            "ctx_postgres_decision",
+            "ctx_acid_reason"
+          ]
+        }
+      ],
+      "facts": [
+        {
+          "id": "ctx_postgres_decision",
+          "label": "PostgreSQL chosen",
+          "content": "Chose PostgreSQL for ACID compliance and transactional guarantees",
+          "node_type": "decision",
+          "timestamp": "2026-01-10T14:00:00+00:00"
+        },
+        {
+          "id": "ctx_acid_reason",
+          "label": "ACID compliance required",
+          "content": "ACID compliance is critical for maintaining data integrity in financial transactions",
+          "node_type": "concept",
+          "timestamp": "2026-01-10T14:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "id": "context_assembly_contradiction",
+      "title": "Context Assembly: Contradiction Both-Sides Coverage",
+      "description": "Verify that contradictions surface both the old and new decision with the edge between them",
+      "sessions": [
+        {
+          "id": "context_contra_s1",
+          "timestamp": "2026-02-01T10:00:00+00:00",
+          "transcript": "User: We're using SQLite for now. Agent: Noted SQLite as current database.",
+          "support_fact_ids": [
+            "ctx_sqlite_old"
+          ]
+        },
+        {
+          "id": "context_contra_s2",
+          "timestamp": "2026-03-15T15:30:00+00:00",
+          "transcript": "User: We've switched to PostgreSQL because SQLite has concurrency issues. Agent: Recorded update to PostgreSQL due to scalability needs.",
+          "support_fact_ids": [
+            "ctx_postgres_new",
+            "ctx_concurrency_reason"
+          ]
+        }
+      ],
+      "facts": [
+        {
+          "id": "ctx_sqlite_old",
+          "label": "SQLite original choice",
+          "content": "Originally chose SQLite for simplicity in local development",
+          "node_type": "decision",
+          "timestamp": "2026-02-01T10:00:00+00:00"
+        },
+        {
+          "id": "ctx_postgres_new",
+          "label": "PostgreSQL updated choice",
+          "content": "Updated to PostgreSQL for production deployment and concurrent write support",
+          "node_type": "decision",
+          "timestamp": "2026-03-15T15:30:00+00:00"
+        },
+        {
+          "id": "ctx_concurrency_reason",
+          "label": "Concurrency limitation found",
+          "content": "SQLite cannot handle concurrent writes, which became a blocker for scaling",
+          "node_type": "fact",
+          "timestamp": "2026-03-15T15:30:00+00:00"
+        }
+      ]
+    },
+    {
+      "id": "context_assembly_dependency_chain",
+      "title": "Context Assembly: Multi-Hop Dependency Chain",
+      "description": "Verify that complex dependency chains preserve full reasoning context (decision \u2192 requirement \u2192 underlying fact)",
+      "sessions": [
+        {
+          "id": "context_chain_s1",
+          "timestamp": "2026-01-20T11:00:00+00:00",
+          "transcript": "User: We need FastAPI because we require real-time WebSocket support for concurrent connections. Agent: Captured decision and reasoning chain.",
+          "support_fact_ids": [
+            "ctx_fastapi_decision",
+            "ctx_realtime_req",
+            "ctx_concurrency_fact"
+          ]
+        }
+      ],
+      "facts": [
+        {
+          "id": "ctx_fastapi_decision",
+          "label": "FastAPI backend selected",
+          "content": "Chose FastAPI as the web framework for async-first architecture",
+          "node_type": "decision",
+          "timestamp": "2026-01-20T11:00:00+00:00"
+        },
+        {
+          "id": "ctx_realtime_req",
+          "label": "Real-time communication requirement",
+          "content": "Application requires real-time WebSocket connections for live data updates",
+          "node_type": "concept",
+          "timestamp": "2026-01-20T11:00:00+00:00"
+        },
+        {
+          "id": "ctx_concurrency_fact",
+          "label": "Concurrent connection handling",
+          "content": "System must support thousands of concurrent WebSocket connections with efficient async I/O",
+          "node_type": "fact",
+          "timestamp": "2026-01-20T11:00:00+00:00"
+        }
+      ]
     }
   ],
   "queries": [
@@ -1431,7 +1550,7 @@
     },
     {
       "id": "q63",
-      "query": "we changed our search implementation at some point — what was the before and after",
+      "query": "we changed our search implementation at some point \u2014 what was the before and after",
       "gold_support_ids": [
         "search_pg_trigram",
         "search_opensearch"

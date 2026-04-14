@@ -247,6 +247,20 @@ def extract_choice_entity(text: str) -> tuple[str, str] | None:
         extract_choice_entity("The team prefers async support")
         # → None  (no recognisable technology token)
     """
+    lowered = normalize_text(text)
+    choice_patterns = (
+        r"(?:choose|chose|chosen|picked|use|using|go with|decided to use)\s+(?P<token>[A-Za-z0-9.+-]+)",
+        r"(?:switch to|move to|migrate to)\s+(?P<token>[A-Za-z0-9.+-]+)",
+    )
+    for pattern in choice_patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        token = match.group("token").lower()
+        category = _CHOICE_CATEGORY_BY_TOKEN.get(token)
+        if category is not None:
+            return token, category
+
     tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
     matches: list[tuple[str, str]] = []
 
@@ -267,8 +281,7 @@ def extract_choice_entity(text: str) -> tuple[str, str] | None:
     if not matches:
         return None
 
-    # Return the last match (handles reversal sentences correctly)
-    return matches[-1]
+    return matches[0]
 
 
 def tokenize_text(value: str) -> set[str]:

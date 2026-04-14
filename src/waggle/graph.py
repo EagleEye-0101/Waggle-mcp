@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import heapq
 import json
 import sqlite3
 import threading
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -63,6 +65,41 @@ from waggle.models import (
     TopicResult,
     utc_now,
 )
+
+SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ExpansionMeta:
+    via_relation: str
+    from_node: str
+    effective_priority: float
+
+
+class _NeutralTemporalHints:
+    """Neutral temporal hints for operations without query-driven time intent."""
+    recency_mode: str = "none"
+    time_window_start = None
+    time_window_end = None
+
+
+RELATION_SCORE_BOOST: dict[str, float] = {
+    "contradicts": 0.15,
+    "updates": 0.12,
+    "depends_on": 0.08,
+    "derived_from": 0.05,
+    "part_of": 0.03,
+    "relates_to": 0.00,
+    "similar_to": -0.05,
+    "seed": 0.00,
+}
+
+MUST_PAIR_RELATIONS: frozenset[str] = frozenset({
+    "contradicts",
+    "updates",
+    "depends_on",
+})
+
 
 SCHEMA_VERSION = 2
 
@@ -141,6 +178,16 @@ CREATE INDEX IF NOT EXISTS idx_edges_tenant_relationship ON edges(tenant_id, rel
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 """
+
+RELATION_WEIGHTS: dict[str, float] = {
+    "contradicts": 1.00,
+    "updates": 0.95,
+    "depends_on": 0.85,
+    "derived_from": 0.75,
+    "part_of": 0.70,
+    "relates_to": 0.50,
+    "similar_to": 0.30,
+}
 
 
 def _parse_datetime(raw: str) -> datetime:
@@ -521,7 +568,9 @@ class MemoryGraph:
                 ]
 
             graph = self._load_graph(connection, node_ids=nodes_by_id.keys())
-            expanded_depths = self._expand_node_depths(graph, ranked_seed_ids, max_depth)
+            expanded_depths, expansion_metadata = self._expand_node_depths_with_context(
+                graph, ranked_seed_ids, max_depth
+            )
             candidate_nodes = [nodes_by_id[node_id] for node_id in expanded_depths]
             temporal_candidates = [
                 node for node in candidate_nodes if within_time_window(node, temporal_hints)
@@ -542,8 +591,13 @@ class MemoryGraph:
                 max_degree=max_degree,
                 max_depth=max_depth,
                 expanded_depths=expanded_depths,
+                expansion_metadata=expansion_metadata,
             )
             selected_nodes = scored_nodes[:max_nodes]
+            candidate_pool = {node.id: node for node in candidate_nodes}
+            selected_nodes = self._ensure_support_coverage(
+                selected_nodes, candidate_pool, graph, max_nodes
+            )
             selected_ids = [node.id for node in selected_nodes]
 
             edges = self._fetch_edges_for_nodes(connection, selected_ids)
@@ -1046,7 +1100,7 @@ class MemoryGraph:
             contradiction_edges=contradiction_edges,
         )
 
-    def prime_context(self, *, project: str = "") -> PrimeContextResult:
+    def prime_context(self, *, project: str = "", max_nodes: int = 25) -> PrimeContextResult:
         with self._lock, self._connect() as connection:
             total_nodes = int(
                 connection.execute("SELECT COUNT(*) FROM nodes WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
@@ -1054,25 +1108,101 @@ class MemoryGraph:
             if total_nodes == 0:
                 return PrimeContextResult(project=project, summary="No stored memory is available yet.")
 
-            selected_ids: list[str] = []
-            selected_ids.extend(self._most_connected_node_ids(connection, limit=5))
-            selected_ids.extend(node.id for node in self.list_recent_nodes(limit=5))
+            # Collect seed anchors from multiple sources
+            seed_ids: list[str] = []
+            seed_ids.extend(self._most_connected_node_ids(connection, limit=5))
+            seed_ids.extend(node.id for node in self.list_recent_nodes(limit=5))
             if project.strip():
-                selected_ids.extend(self._find_project_node_ids(connection, project=project, limit=8))
+                seed_ids.extend(self._find_project_node_ids(connection, project=project, limit=8))
+            seed_ids = list(dict.fromkeys(seed_ids))  # Deduplicate
 
-            unique_ids = list(dict.fromkeys(selected_ids))
-            nodes = self._fetch_nodes_by_ids(connection, unique_ids)
-            edges = self._fetch_edges_for_nodes(connection, [node.id for node in nodes])
+            if not seed_ids:
+                return PrimeContextResult(project=project, summary="No seed nodes found for priming.")
 
-        summary = (
-            f"Prime context for '{project}' with {len(nodes)} nodes selected from {total_nodes} total nodes."
-            if project.strip()
-            else f"Prime context with {len(nodes)} nodes selected from {total_nodes} total nodes."
+            # Load all embeddable nodes and build graph
+            node_rows = connection.execute(
+                """
+                SELECT id, label, content, node_type, tags, source_prompt,
+                       created_at, updated_at, access_count, embedding
+                FROM nodes
+                WHERE tenant_id = ? AND embedding IS NOT NULL
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+
+            if not node_rows:
+                return PrimeContextResult(project=project, summary="No embeddable nodes available for expansion.")
+
+            nodes_by_id: dict[str, Node] = {}
+            for row in node_rows:
+                node = self._row_to_node(row)
+                nodes_by_id[node.id] = node
+
+            graph = self._load_graph(connection, node_ids=nodes_by_id.keys())
+
+            # Expand from seeds using relation-aware traversal
+            max_depth = 2
+            expanded_depths, expansion_metadata = self._expand_node_depths_with_context(
+                graph, seed_ids, max_depth
+            )
+
+            # Build candidate nodes from expansion
+            candidate_nodes = [
+                nodes_by_id[nid]
+                for nid in expanded_depths
+                if nid in nodes_by_id
+            ]
+            if not candidate_nodes:
+                return PrimeContextResult(project=project, summary="Expansion produced no candidate nodes.")
+
+            # Score with relation-aware ranking (no natural language query)
+            similarity_by_id = {nid: 0.0 for nid in expanded_depths}
+            lexical_by_id = {nid: 0.0 for nid in expanded_depths}
+            # Boost seed IDs synthetically
+            for seed_id in seed_ids:
+                if seed_id in similarity_by_id:
+                    similarity_by_id[seed_id] = 0.5
+
+            degree_by_id = dict(graph.degree(expanded_depths.keys()))
+            max_access = max((node.access_count for node in candidate_nodes), default=0)
+            max_degree = max(degree_by_id.values(), default=0)
+
+            temporal_hints = _NeutralTemporalHints()
+            scored_nodes = self._sort_scored_nodes(
+                candidate_nodes,
+                temporal_hints=temporal_hints,
+                similarity_by_id=similarity_by_id,
+                lexical_by_id=lexical_by_id,
+                degree_by_id=degree_by_id,
+                max_access=max_access,
+                max_degree=max_degree,
+                max_depth=max_depth,
+                expanded_depths=expanded_depths,
+                expansion_metadata=expansion_metadata,
+            )
+
+            # Apply support coverage
+            selected_nodes = scored_nodes[:max_nodes]
+            candidate_pool = {node.id: node for node in candidate_nodes}
+            selected_nodes = self._ensure_support_coverage(
+                selected_nodes, candidate_pool, graph, max_nodes
+            )
+
+            selected_ids = [node.id for node in selected_nodes]
+            edges = self._fetch_edges_for_nodes(connection, selected_ids)
+
+        # Build structured summary
+        summary = self._build_prime_summary(
+            selected_nodes=selected_nodes,
+            edges=edges,
+            total_nodes_in_graph=total_nodes,
+            project=project,
         )
+
         return PrimeContextResult(
             project=project,
             summary=summary,
-            nodes=nodes,
+            nodes=selected_nodes,
             edges=edges,
             total_nodes_in_graph=total_nodes,
         )
@@ -1117,6 +1247,55 @@ class MemoryGraph:
                 )
             )
         return TopicResult(clusters=clusters, total_clusters=len(clusters))
+
+    def _build_prime_summary(
+        self,
+        *,
+        selected_nodes: list[Node],
+        edges: list[Edge],
+        total_nodes_in_graph: int,
+        project: str = "",
+    ) -> str:
+        """Build a structured summary of prime context with type and relationship counts."""
+        # Count node types
+        type_counts: dict[str, int] = {}
+        for node in selected_nodes:
+            type_counts[node.node_type.value] = type_counts.get(node.node_type.value, 0) + 1
+
+        # Count edge relationships
+        relationship_counts: dict[str, int] = {}
+        for edge in edges:
+            rel = edge.relationship.value
+            relationship_counts[rel] = relationship_counts.get(rel, 0) + 1
+
+        # Build type breakdown
+        type_breakdown = ", ".join(
+            f"{count} {ttype}" for ttype, count in sorted(type_counts.items())
+        ) if type_counts else "no nodes"
+
+        # Build relationship breakdown
+        relationship_breakdown = ", ".join(
+            f"{count} {rel}" for rel, count in sorted(relationship_counts.items())
+        ) if relationship_counts else "no edges"
+
+        # Check for contradictions
+        has_contradictions = "contradicts" in relationship_counts
+        contradiction_warning = " [⚠ Contradictions present]" if has_contradictions else ""
+
+        # Check for questions
+        has_questions = "question" in type_counts
+        question_warning = " [?]" if has_questions else ""
+
+        # Build base summary
+        if project.strip():
+            base = f"Prime context for project '{project}': {len(selected_nodes)} nodes ({type_breakdown}) with {len(edges)} edges ({relationship_breakdown})"
+        else:
+            base = f"Prime context: {len(selected_nodes)} nodes ({type_breakdown}) with {len(edges)} edges ({relationship_breakdown})"
+
+        base += f" from {total_nodes_in_graph} total nodes"
+        base += contradiction_warning + question_warning
+
+        return base
 
     def _require_node(self, connection: sqlite3.Connection, node_id: str) -> None:
         if self._fetch_node_row(connection, node_id) is None:
@@ -1396,12 +1575,33 @@ class MemoryGraph:
     ) -> nx.DiGraph:
         graph = nx.DiGraph()
         graph.add_nodes_from(node_ids)
-        for row in connection.execute(
-            "SELECT source_id, target_id FROM edges WHERE tenant_id = ?",
+        rows = connection.execute(
+            """
+            SELECT source_id, target_id, relationship, weight, metadata, created_at
+            FROM edges
+            WHERE tenant_id = ?
+            """,
             (self.tenant_id,),
-        ).fetchall():
-            graph.add_edge(row["source_id"], row["target_id"])
+        ).fetchall()
+
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+
+            graph.add_edge(
+                row["source_id"],
+                row["target_id"],
+                relationship=row["relationship"] or "relates_to",
+                weight=float(row["weight"]) if row["weight"] is not None else 1.0,
+                metadata=metadata,
+                created_at=row["created_at"],
+            )
         return graph
+
+    def _relation_priority(self, relationship: str) -> float:
+        return RELATION_WEIGHTS.get(relationship, 0.50)
 
     def _temporal_sort_value(self, node: Node, hints: Any) -> float:
         if hints.recency_mode == "latest":
@@ -1429,9 +1629,10 @@ class MemoryGraph:
         max_degree: int,
         max_depth: int,
         expanded_depths: dict[str, int],
+        expansion_metadata: dict[str, ExpansionMeta] | None = None,
     ) -> list[Node]:
         def combined_score(node: Node) -> float:
-            return score_node(
+            base = score_node(
                 node=node,
                 semantic_similarity=similarity_by_id.get(node.id, 0.0),
                 lexical_score=lexical_by_id.get(node.id, 0.0),
@@ -1439,6 +1640,12 @@ class MemoryGraph:
                 degree_score=(degree_by_id.get(node.id, 0) / max_degree if max_degree > 0 else 0.0),
                 depth=expanded_depths.get(node.id, max_depth + 1),
             ) + temporal_score_adjustment(node, temporal_hints)
+            
+            if expansion_metadata is not None and node.id in expansion_metadata:
+                meta = expansion_metadata[node.id]
+                base += RELATION_SCORE_BOOST.get(meta.via_relation, 0.0)
+            
+            return base
 
         if temporal_hints.recency_mode == "latest":
             return sorted(
@@ -1455,6 +1662,137 @@ class MemoryGraph:
             key=lambda node: (-combined_score(node), -node.updated_at.timestamp(), node.label.lower()),
         )
 
+    def _expand_node_depths_with_context(
+        self,
+        graph: nx.DiGraph,
+        seed_ids: list[str],
+        max_depth: int,
+        *,
+        min_priority: float = 0.20,
+        decay: float = 0.70,
+    ) -> tuple[dict[str, int], dict[str, ExpansionMeta]]:
+        ordered: dict[str, int] = {}
+        metadata: dict[str, ExpansionMeta] = {}
+        seen: set[str] = set()
+
+        # Heap entries: (neg_priority, tiebreaker, node_id, depth, via_relation, from_node, effective_priority)
+        _counter = 0
+        heap: list[tuple[float, int, str, int, str, str, float]] = []
+
+        for seed_id in seed_ids:
+            heapq.heappush(heap, (0.0, _counter, seed_id, 0, "seed", "", 0.0))
+            _counter += 1
+
+        while heap:
+            neg_pri, _, node_id, depth, via_relation, from_node, effective_priority = heapq.heappop(heap)
+
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            ordered[node_id] = depth
+            if via_relation != "seed":
+                metadata[node_id] = ExpansionMeta(
+                    via_relation=via_relation,
+                    from_node=from_node,
+                    effective_priority=effective_priority,
+                )
+
+            if depth >= max_depth:
+                continue
+
+            neighbors_with_data: list[tuple[str, dict]] = []
+
+            if graph.has_node(node_id):
+                for _, neighbor, data in graph.edges(node_id, data=True):
+                    if neighbor not in seen:
+                        neighbors_with_data.append((neighbor, data))
+
+                for predecessor, _, data in graph.in_edges(node_id, data=True):
+                    if predecessor not in seen:
+                        neighbors_with_data.append((predecessor, data))
+
+            for neighbor, data in neighbors_with_data:
+                relationship = data.get("relationship", "relates_to")
+                weight = float(data.get("weight", 1.0))
+
+                effective = (
+                    self._relation_priority(relationship)
+                    * weight
+                    * (decay ** depth)
+                )
+
+                if effective < min_priority:
+                    continue
+
+                heapq.heappush(
+                    heap,
+                    (-effective, _counter, neighbor, depth + 1, relationship, node_id, effective),
+                )
+                _counter += 1
+
+        return ordered, metadata
+
+    def _expand_node_depths(
+        self,
+        graph: nx.DiGraph,
+        seed_ids: list[str],
+        max_depth: int,
+        *,
+        min_priority: float = 0.20,
+        decay: float = 0.70,
+    ) -> dict[str, int]:
+        ordered, _ = self._expand_node_depths_with_context(
+            graph, seed_ids, max_depth, min_priority=min_priority, decay=decay
+        )
+        return ordered
+
+    def _ensure_support_coverage(
+        self,
+        selected_nodes: list[Node],
+        candidate_pool: dict[str, Node],
+        graph: nx.DiGraph,
+        max_nodes: int,
+    ) -> list[Node]:
+        """Augment selected nodes with supporting context for contradictions, updates, and dependencies."""
+        if len(selected_nodes) >= max_nodes:
+            return selected_nodes
+
+        coverage_nodes: list[Node] = []
+        seen = {node.id for node in selected_nodes}
+
+        for node in selected_nodes:
+            if len(selected_nodes) + len(coverage_nodes) >= max_nodes:
+                break
+
+            if graph.has_node(node.id):
+                # Find supporting edges via MUST_PAIR_RELATIONS
+                for _, neighbor, data in graph.edges(node.id, data=True):
+                    if neighbor in seen or neighbor not in candidate_pool:
+                        continue
+                    relationship = data.get("relationship", "relates_to")
+                    if relationship in MUST_PAIR_RELATIONS:
+                        support_node = candidate_pool[neighbor]
+                        if support_node not in coverage_nodes:
+                            coverage_nodes.append(support_node)
+                            seen.add(neighbor)
+                        if len(selected_nodes) + len(coverage_nodes) >= max_nodes:
+                            break
+
+                # Find incoming edges (predecessors) with strong relationships
+                for predecessor, _, data in graph.in_edges(node.id, data=True):
+                    if predecessor in seen or predecessor not in candidate_pool:
+                        continue
+                    relationship = data.get("relationship", "relates_to")
+                    if relationship in MUST_PAIR_RELATIONS:
+                        support_node = candidate_pool[predecessor]
+                        if support_node not in coverage_nodes:
+                            coverage_nodes.append(support_node)
+                            seen.add(predecessor)
+                        if len(selected_nodes) + len(coverage_nodes) >= max_nodes:
+                            break
+
+        return selected_nodes + coverage_nodes[: max_nodes - len(selected_nodes)]
+
     def _build_topic_partition(self, graph: nx.Graph, nodes: list[Node]) -> dict[str, int]:
         if graph.number_of_edges() == 0:
             return {node.id: index for index, node in enumerate(nodes)}
@@ -1470,25 +1808,7 @@ class MemoryGraph:
                     partition[str(member)] = cluster_id
             return partition
 
-    def _expand_node_depths(self, graph: nx.DiGraph, seed_ids: list[str], max_depth: int) -> dict[str, int]:
-        ordered: dict[str, int] = {}
-        seen: set[str] = set()
-        queue: deque[tuple[str, int]] = deque((seed_id, 0) for seed_id in seed_ids)
-
-        while queue:
-            node_id, depth = queue.popleft()
-            if node_id in seen:
-                continue
-            seen.add(node_id)
-            ordered[node_id] = depth
-            if depth >= max_depth:
-                continue
-            neighbors = list(graph.predecessors(node_id)) + list(graph.successors(node_id))
-            for neighbor in neighbors:
-                if neighbor not in seen:
-                    queue.append((neighbor, depth + 1))
-
-        return ordered
+    
 
     def _fetch_edges_for_nodes(
         self,

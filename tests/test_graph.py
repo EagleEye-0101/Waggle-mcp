@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 
 from waggle.graph import MemoryGraph
@@ -266,6 +267,67 @@ def test_conflict_detection_creates_contradiction_edge(tmp_path: Path) -> None:
     related = graph.get_related(node_id=second.node.id, max_depth=1)
     assert any(edge.relationship == RelationType.CONTRADICTS for edge in related.edges)
     assert first.node.id in {node.id for node in related.nodes}
+
+
+def test_load_graph_preserves_edge_attributes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    a = graph.add_node(label="A", content="A", node_type=NodeType.FACT).node
+    b = graph.add_node(label="B", content="B", node_type=NodeType.FACT).node
+
+    graph.add_edge(
+        source_id=a.id,
+        target_id=b.id,
+        relationship=RelationType.CONTRADICTS,
+        weight=0.9,
+    )
+
+    with graph._connect() as connection:
+        g = graph._load_graph(connection, node_ids=[a.id, b.id])
+
+    edge_data = g.edges[a.id, b.id]
+    assert edge_data["relationship"] == "contradicts"
+    assert edge_data["weight"] == 0.9
+    assert edge_data["metadata"] == {}
+
+
+def test_expand_node_depths_prioritizes_stronger_relations(tmp_path: Path) -> None:
+    graph_store = make_graph(tmp_path)
+    graph = nx.DiGraph()
+    graph.add_edge("seed", "conflict", relationship="contradicts", weight=1.0)
+    graph.add_edge("seed", "support", relationship="depends_on", weight=1.0)
+    graph.add_edge("seed", "weak", relationship="similar_to", weight=1.0)
+
+    ordered = graph_store._expand_node_depths(graph, ["seed"], max_depth=1)
+
+    keys = list(ordered.keys())
+
+    # seed must always be first
+    assert keys[0] == "seed"
+
+    # Now check PRIORITY ORDER
+    conflict_idx = keys.index("conflict")
+    support_idx = keys.index("support")
+    weak_idx = keys.index("weak")
+
+    assert conflict_idx < support_idx < weak_idx
+
+
+def test_expand_node_depths_prunes_weak_paths(tmp_path: Path) -> None:
+    graph_store = make_graph(tmp_path)
+    graph = nx.DiGraph()
+    graph.add_edge("seed", "a", relationship="depends_on", weight=1.0)
+    graph.add_edge("a", "b", relationship="similar_to", weight=1.0)
+
+    ordered = graph_store._expand_node_depths(
+        graph,
+        ["seed"],
+        max_depth=2,
+        min_priority=0.25,
+    )
+
+    assert ordered["seed"] == 0
+    assert ordered["a"] == 1
+    assert "b" not in ordered
 
 
 def test_observe_conversation_extracts_nodes(tmp_path: Path) -> None:
