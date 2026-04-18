@@ -137,6 +137,20 @@ Each call:
 
 No separate schema authoring is required. The deterministic parser turns conversation turns into typed graph memory directly.
 
+### Closing extraction gaps
+
+The parser is intentionally deterministic, so extraction misses should be treated as fixture gaps, not mystery failures.
+
+The fastest workflow is:
+- reproduce the miss with a two-line `observe_conversation` smoke test
+- confirm whether the turn landed in replay only or also created a typed node
+- patch the extraction rule
+- add the exact turn to `benchmarks/fixtures/extraction_cases.json`
+- add a focused regression in `tests/test_graph.py`
+- rerun the benchmark harness and refresh `tests/artifacts/benchmark_current.json`
+
+That keeps README claims tied to checked-in fixtures instead of one-off manual smoke tests.
+
 ---
 
 ## MCP tools
@@ -186,7 +200,7 @@ Benchmark summary:
 
 | Area | Corpus | Result |
 |------|--------|--------|
-| Extraction | 12-case deterministic fixture | `100%` |
+| Extraction | 25-case deterministic fixture | `100%` |
 | Retrieval | 18-query retrieval fixture | `83% Hit@k` |
 | Comparative efficiency | 27-scenario / 66-query corpus | `88% Hit@k`, `73% exact support`, `37.7` mean tokens |
 | Query stress | 40 adversarial retrieval-only cases | `98% Hit@k`, `98% exact support` |
@@ -223,7 +237,7 @@ Detailed reference material lives outside the landing flow:
 
 ## Next Steps
 
-- Expand the extraction corpus beyond the current 12 cases so robustness claims are based on larger paraphrase- and temporality-heavy fixtures.
+- Expand the extraction corpus beyond the current 25 cases so robustness claims are based on larger paraphrase-, temporal-, multi-fact-, and adversarial-negation-heavy fixtures.
 - Publish a short LongMemEval methodology note, including cold vs warm cache runs and the reranked comparison path.
 - Tighten replay/fusion ranking for recall-heavy workloads and improve provenance summaries in exported bundles.
 - Polish Neo4j query paths and large-vault import reporting.

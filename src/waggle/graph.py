@@ -1796,6 +1796,7 @@ class MemoryGraph:
         )
 
         result = ObservationResult()
+        stored_candidate_records: list[tuple[Node, list[str]]] = []
         with self._lock, self._connect() as connection:
             next_turn_index = self._next_transcript_turn_index(connection, session_id=session_id)
             turns = [
@@ -1841,6 +1842,7 @@ class MemoryGraph:
                 valid_from=observed_at,
             )
             result.stored_nodes.append(store_result.node)
+            stored_candidate_records.append((store_result.node, candidate_tags))
             if store_result.created:
                 result.created_count += 1
             else:
@@ -1848,6 +1850,29 @@ class MemoryGraph:
             for conflict in store_result.conflicts:
                 if conflict.other_node_id not in {item.other_node_id for item in result.conflicts}:
                     result.conflicts.append(conflict)
+
+        decision_nodes = [
+            (node, tags)
+            for node, tags in stored_candidate_records
+            if node.node_type == NodeType.DECISION
+        ]
+        rationale_nodes = [
+            (node, tags)
+            for node, tags in stored_candidate_records
+            if "decision-rationale" in tags and node.node_type == NodeType.FACT
+        ]
+        for decision_node, decision_tags in decision_nodes:
+            decision_categories = {tag for tag in decision_tags if tag in {"database", "backend-framework", "frontend-framework", "auth-mechanism", "api-style"}}
+            for rationale_node, rationale_tags in rationale_nodes:
+                rationale_categories = {tag for tag in rationale_tags if tag in {"database", "backend-framework", "frontend-framework", "auth-mechanism", "api-style"}}
+                if rationale_categories and decision_categories and not (rationale_categories & decision_categories):
+                    continue
+                self.add_edge(
+                    source_id=decision_node.id,
+                    target_id=rationale_node.id,
+                    relationship=RelationType.DEPENDS_ON,
+                    metadata={"origin": "observe_conversation"},
+                )
         return result
 
     def graph_diff(self, *, since: str = "24h") -> GraphDiffResult:

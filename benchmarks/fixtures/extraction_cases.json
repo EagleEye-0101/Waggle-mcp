@@ -61,6 +61,89 @@
     "expected_node_types": ["preference"]
   },
   {
+    "name": "favorite_language_preference",
+    "user_message": "Remember that my favorite programming language is Python.",
+    "assistant_response": "I'll remember that your favorite programming language is Python.",
+    "expected_node_types": ["preference"]
+  },
+  {
+    "name": "comparative_preference",
+    "user_message": "I like FastAPI more than Django for APIs.",
+    "assistant_response": "Noted. I'll bias backend examples toward FastAPI.",
+    "expected_node_types": ["preference"]
+  },
+  {
+    "name": "habitual_tool_choice",
+    "user_message": "I always use PostgreSQL for this kind of project.",
+    "assistant_response": "Understood. I'll treat PostgreSQL as the default database preference.",
+    "expected_node_types": ["preference"]
+  },
+  {
+    "name": "go_to_preference",
+    "user_message": "PostgreSQL is my go-to database.",
+    "assistant_response": "Got it. I'll remember PostgreSQL as your default database choice.",
+    "expected_node_types": ["preference"]
+  },
+  {
+    "name": "switched_to_framework",
+    "user_message": "I've switched to FastAPI for backend services.",
+    "assistant_response": "Okay. I'll remember that FastAPI is the current backend decision.",
+    "expected_node_types": ["decision"]
+  },
+  {
+    "name": "stick_with_framework",
+    "user_message": "We should stick with Next.js for the frontend.",
+    "assistant_response": "Agreed. I'll treat Next.js as the frontend decision.",
+    "expected_node_types": ["decision"]
+  },
+  {
+    "name": "single_turn_multi_fact_backend_and_jwt",
+    "user_message": "We are using FastAPI for the backend and JWT tokens expire in 15 minutes.",
+    "assistant_response": "Understood. I'll remember both.",
+    "expected_node_types": ["fact"]
+  },
+  {
+    "name": "multi_clause_tool_switch",
+    "user_message": "I switched from VS Code to Neovim, and I'm using tmux now too.",
+    "assistant_response": "Understood. I'll remember both tool choices.",
+    "expected_node_types": ["decision"]
+  },
+  {
+    "name": "causal_fact_and_decision",
+    "user_message": "The deadline moved to March, so we dropped the GraphQL migration.",
+    "assistant_response": "Understood. I'll remember the reason and the decision.",
+    "expected_node_types": ["fact", "decision"],
+    "min_type_matches": 2
+  },
+  {
+    "name": "hedged_redis_proposal",
+    "user_message": "I think we should probably go with Redis.",
+    "assistant_response": "Understood.",
+    "expected_node_types": ["note"],
+    "forbidden_node_types": ["decision"]
+  },
+  {
+    "name": "conditional_terraform_choice",
+    "user_message": "Unless the team objects, let's use Terraform.",
+    "assistant_response": "Understood.",
+    "expected_node_types": ["note"],
+    "forbidden_node_types": ["decision"]
+  },
+  {
+    "name": "revisit_if_latency",
+    "user_message": "We might need to revisit this if latency gets worse.",
+    "assistant_response": "Understood.",
+    "expected_node_types": ["note"],
+    "forbidden_node_types": ["concept", "decision"]
+  },
+  {
+    "name": "negated_tool_choice",
+    "user_message": "We're not using MongoDB anymore.",
+    "assistant_response": "Understood. I'll remember that.",
+    "expected_node_types": ["decision"],
+    "forbidden_node_types": ["entity"]
+  },
+  {
     "name": "noise_and_interruption",
     "user_message": "Uh, one more thing before I forget: the API rate limit is 120 requests per minute.",
     "assistant_response": "Noted. I'll include the 120 rpm limit in the gateway notes.",

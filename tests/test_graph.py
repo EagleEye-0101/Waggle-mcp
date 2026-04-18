@@ -593,6 +593,55 @@ def test_observe_conversation_extracts_nodes(tmp_path: Path) -> None:
     assert all(node.valid_from is not None for node in result.stored_nodes)
 
 
+def test_observe_conversation_extracts_favorite_preference_statement(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    result = graph.observe_conversation(
+        user_message="Remember that my favorite programming language is Python.",
+        assistant_response="I'll remember that your favorite programming language is Python.",
+    )
+
+    preference_nodes = [node for node in result.stored_nodes if node.node_type == NodeType.PREFERENCE]
+
+    assert preference_nodes
+    assert any("favorite programming language is Python" in node.content for node in preference_nodes)
+    assert any("speaker:user" in node.tags for node in preference_nodes)
+
+
+def test_observe_conversation_extracts_common_preference_and_decision_phrasings(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    cases = [
+        (
+            "I always use PostgreSQL for this kind of project.",
+            "Understood. I'll treat PostgreSQL as the default database preference.",
+            NodeType.PREFERENCE,
+        ),
+        (
+            "PostgreSQL is my go-to database.",
+            "Got it. I'll remember PostgreSQL as your default database choice.",
+            NodeType.PREFERENCE,
+        ),
+        (
+            "I've switched to FastAPI for backend services.",
+            "Okay. I'll remember that FastAPI is the current backend decision.",
+            NodeType.DECISION,
+        ),
+        (
+            "We should stick with Next.js for the frontend.",
+            "Agreed. I'll treat Next.js as the frontend decision.",
+            NodeType.DECISION,
+        ),
+    ]
+
+    for user_message, assistant_response, expected_type in cases:
+        result = graph.observe_conversation(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
+        assert any(node.node_type == expected_type for node in result.stored_nodes)
+
+
 def test_duplicate_nodes_accumulate_evidence_records(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
 
@@ -755,6 +804,82 @@ def test_observe_conversation_extracts_clean_database_and_auth_facts(tmp_path: P
     assert "MySQL replication has been painful" in labels
     assert "I'll remember that PostgreSQL was chosen," not in labels
     assert "FastAPI" not in labels
+
+
+def test_observe_conversation_splits_multi_clause_turns_into_multiple_nodes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    result = graph.observe_conversation(
+        user_message="I switched from VS Code to Neovim, and I'm using tmux now too.",
+        assistant_response="Understood. I'll remember both tool choices.",
+    )
+
+    decision_contents = {node.content for node in result.stored_nodes if node.node_type == NodeType.DECISION}
+
+    assert "I switched from VS Code to Neovim." in decision_contents
+    assert "I'm using tmux now too." in decision_contents
+
+
+def test_observe_conversation_extracts_causal_fact_and_decision_with_dependency_edge(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    result = graph.observe_conversation(
+        user_message="The deadline moved to March, so we dropped the GraphQL migration.",
+        assistant_response="Understood. I'll remember the reason and the decision.",
+    )
+
+    fact_node = next(node for node in result.stored_nodes if node.node_type == NodeType.FACT)
+    decision_node = next(node for node in result.stored_nodes if node.node_type == NodeType.DECISION)
+
+    assert fact_node.content == "The deadline moved to March."
+    assert decision_node.content == "we dropped the GraphQL migration."
+    related = graph.get_related(node_id=decision_node.id, max_depth=1)
+    assert any(
+        edge.relationship == RelationType.DEPENDS_ON and edge.target_id == fact_node.id
+        for edge in related.edges
+    )
+
+
+def test_observe_conversation_stores_hedged_and_conditional_turns_as_notes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    hedged = graph.observe_conversation(
+        user_message="I think we should probably go with Redis.",
+        assistant_response="Understood.",
+    )
+    conditional = graph.observe_conversation(
+        user_message="Unless the team objects, let's use Terraform.",
+        assistant_response="Understood.",
+    )
+    revisit = graph.observe_conversation(
+        user_message="We might need to revisit this if latency gets worse.",
+        assistant_response="Understood.",
+    )
+
+    hedged_node = hedged.stored_nodes[0]
+    conditional_node = conditional.stored_nodes[0]
+    revisit_node = revisit.stored_nodes[0]
+
+    assert hedged_node.node_type == NodeType.NOTE
+    assert "hedged" in hedged_node.tags
+    assert conditional_node.node_type == NodeType.NOTE
+    assert "conditional" in conditional_node.tags
+    assert revisit_node.node_type == NodeType.NOTE
+
+
+def test_observe_conversation_preserves_negated_tool_choices(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    result = graph.observe_conversation(
+        user_message="We're not using MongoDB anymore.",
+        assistant_response="Understood. I'll remember that.",
+    )
+
+    decision_node = next(node for node in result.stored_nodes if node.node_type == NodeType.DECISION)
+
+    assert decision_node.content == "We're not using MongoDB anymore."
+    assert "negated" in decision_node.tags
+    assert "choice:mongodb" in decision_node.tags
 
 
 def test_observe_conversation_creates_database_contradiction_edges(tmp_path: Path) -> None:

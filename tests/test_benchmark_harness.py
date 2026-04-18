@@ -38,7 +38,7 @@ class FakeEmbeddingModel:
 def test_fixture_loading_is_auditable() -> None:
     fixtures = load_benchmark_fixtures()
 
-    assert len(fixtures["extraction_cases"]) == 12
+    assert len(fixtures["extraction_cases"]) == 25
     assert len(fixtures["retrieval_cases"]["nodes"]) == 18
     assert len(fixtures["retrieval_cases"]["queries"]) == 18
     assert len(fixtures["dedup_cases"]) == 22
@@ -63,7 +63,7 @@ def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
     dedup = next(metric for metric in report.metrics if metric.metric == "deduplication")
 
     assert extraction.backend == "regex"
-    assert extraction.case_count == 12
+    assert extraction.case_count == 25
     assert retrieval.backend == "semantic-query"
     assert retrieval.case_count == 18
     assert "corpus_nodes" in retrieval.metadata

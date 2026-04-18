@@ -38,17 +38,41 @@ _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s*")
 _QUESTION_PREFIX_RE = re.compile(r"^(why|what|how|when|where|who|which|can|could|should|do|does|did|is|are)\b")
 _FILE_PATH_RE = re.compile(r"\b(?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]+\b|\b[\w.-]+\.(?:py|ts|tsx|js|jsx|rs|go|java|kt|rb|php|md|json|yaml|yml|toml|sql)\b")
 _ENTITY_RE = re.compile(r"\b(?:[A-Z]{2,}[A-Z0-9]*|[A-Z][a-z]+(?:[A-Z][A-Za-z0-9]+)+|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
-_PREFERENCE_RE = re.compile(r"\b(?:i\s+)?(?:prefer|like|love|want|favo(?:u)?r|avoid)\b", re.IGNORECASE)
+_PREFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"(?:i\s+)?(?:prefer|like|love|want|favo(?:u)?r|avoid)"
+    r"|favorite"
+    r"|favourite"
+    r")\b",
+    re.IGNORECASE,
+)
+_ALWAYS_USE_RE = re.compile(r"\b(?:i\s+)?always\s+use\b", re.IGNORECASE)
+_GO_TO_PREFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"[A-Za-z][A-Za-z0-9.+-]*\s+is\s+my\s+go(?:-|\s)?to"
+    r"|my\s+go(?:-|\s)?to(?:\s+\w+)?\s+is\s+[A-Za-z][A-Za-z0-9.+-]*"
+    r")\b",
+    re.IGNORECASE,
+)
 _DECISION_RE = re.compile(
     r"\b(?:let's use|lets use|we should use|go with|stay with|stick with|we are using|we're using|"
+    r"i am using|i'm using|im using|"
     r"we decided|decided to use|final decision(?:\s+is)?|decision is|choose|chose|chosen|picked)\b",
     re.IGNORECASE,
 )
 _NEGATION_RE = re.compile(r"\b(?:avoid|not|don't|dont|won't|wont|no longer)\b", re.IGNORECASE)
+_NEGATED_USE_RE = re.compile(
+    r"\b(?:we are|we're|were|i am|i'm|im)?\s*not using\s+(?P<token>[A-Za-z][A-Za-z0-9.+-]*)\b"
+    r"|\bno longer using\s+(?P<token_no_longer>[A-Za-z][A-Za-z0-9.+-]*)\b",
+    re.IGNORECASE,
+)
 _SWITCH_RE = re.compile(
     r"\b(?:switch(?:ed|ing)?|move(?:d|ing)?|migrate(?:d|ing)?|reconsider(?:ed|ing)?|pivot(?:ed|ing)?|dropped)\b",
     re.IGNORECASE,
 )
+_HEDGED_RE = re.compile(r"\b(?:i think|probably|maybe|might|may|unless)\b", re.IGNORECASE)
+_CONDITIONAL_RE = re.compile(r"\b(?:if|unless)\b", re.IGNORECASE)
+_REVISIT_RE = re.compile(r"\brevisit\b", re.IGNORECASE)
 _ASSISTANT_MEMORY_PREFIX_RE = re.compile(
     r"^\s*(?:(?:understood|got it|okay|ok|sure)[,\s.-]+)?(?:i(?:'ll| will)\s+)?"
     r"(?:remember|note|store|track|keep(?:\s+in\s+mind)?)(?:\s+that)?\s+",
@@ -71,6 +95,12 @@ _RATE_LIMIT_RE = re.compile(
 _REQUIREMENT_RE = re.compile(r"\b(?:need|needs|must have|require|requires)\s+(?P<item>[^.?!]+)", re.IGNORECASE)
 _TODO_RE = re.compile(r"^(?:todo:?|to do:?|add)\s+(?P<item>[^.?!]+)", re.IGNORECASE)
 _BECAUSE_SPLIT_RE = re.compile(r"\bbecause\b", re.IGNORECASE)
+_SO_SPLIT_RE = re.compile(r",?\s+so\s+", re.IGNORECASE)
+_CLAUSE_BREAK_RE = re.compile(
+    r"\s*[;—]\s*"
+    r"|,\s+(?:and\s+)?(?=(?:i(?:'m| am)?|im|we(?:'re| are)?|were|they(?:'re| are)?|the team)\b)",
+    re.IGNORECASE,
+)
 
 _ACTION_TOKENS = {
     "prefer",
@@ -260,6 +290,9 @@ def extract_choice_entity(text: str) -> tuple[str, str] | None:
         r"(?:choose|chose|chosen|picked|use|using|go with|decided to use)\s+(?P<token>[A-Za-z0-9.+-]+)",
         r"(?:we are using|we're using|stay with|stick with|final decision is|decision is|record)\s+(?P<token>[A-Za-z0-9.+-]+)",
         r"(?:switch to|switched to|move to|moved to|migrate to|migrated to|pivot to|pivoted to)\s+(?P<token>[A-Za-z0-9.+-]+)",
+        r"(?:always use)\s+(?P<token>[A-Za-z0-9.+-]+)",
+        r"(?P<token>[A-Za-z0-9.+-]+)\s+is\s+my\s+go(?:-|\s)?to",
+        r"my\s+go(?:-|\s)?to(?:\s+\w+)?\s+is\s+(?P<token>[A-Za-z0-9.+-]+)",
     )
     for pattern in choice_patterns:
         match = re.search(pattern, lowered)
@@ -358,6 +391,8 @@ def infer_node_type(text: str) -> NodeType:
         return NodeType.QUESTION
     if any(keyword in lowered for keyword in ("prefer", "likes", "wants", "favorite", "favourite", "avoid")):
         return NodeType.PREFERENCE
+    if _ALWAYS_USE_RE.search(lowered) or _GO_TO_PREFERENCE_RE.search(lowered):
+        return NodeType.PREFERENCE
     if any(keyword in lowered for keyword in ("decided", "decision", "will use", "we will", "choose", "chosen")):
         return NodeType.DECISION
     if any(keyword in lowered for keyword in ("project", "service", "database", "api", "company", "team", "user")):
@@ -396,7 +431,20 @@ def split_atomic_items(content: str) -> list[str]:
     sentence_parts = []
     for block in lines or [stripped]:
         sentence_parts.extend(part.strip() for part in _SENTENCE_SPLIT_RE.split(block) if part.strip())
-    return _dedupe_preserve_order(sentence_parts or [stripped])
+    atomic_parts: list[str] = []
+    for sentence in sentence_parts or [stripped]:
+        atomic_parts.extend(_split_compound_observation(sentence))
+    return _dedupe_preserve_order(atomic_parts or [stripped])
+
+
+def _split_compound_observation(sentence: str) -> list[str]:
+    parts = [part.strip() for part in _CLAUSE_BREAK_RE.split(sentence) if part.strip()]
+    normalized: list[str] = []
+    for part in parts or [sentence.strip()]:
+        cleaned = re.sub(r"^(?:oh\s+and|and)\s+", "", part.strip(), flags=re.IGNORECASE)
+        if cleaned:
+            normalized.append(cleaned)
+    return normalized
 
 
 def lexical_overlap(query: str, label: str, content: str) -> float:
@@ -577,11 +625,12 @@ def extract_conversation_candidates(
             node_type = _infer_observed_node_type(sentence)
             if node_type is not None:
                 label = sentence.strip() if node_type == NodeType.QUESTION else infer_label(sentence)
+                content = sentence if node_type == NodeType.QUESTION else _normalize_statement(sentence)
                 _append_candidate(
                     candidates,
                     seen,
                     label=label,
-                    content=sentence,
+                    content=content,
                     node_type=node_type,
                     tags=["observed", f"speaker:{speaker}"],
                 )
@@ -673,6 +722,9 @@ def extract_focus_tokens(text: str) -> set[str]:
     lowered = normalize_text(text)
     patterns = (
         r"(?:prefer|prefers|like|likes|love|loves|want|wants|avoid|avoids)\s+(?P<focus>.+)",
+        r"(?:always use)\s+(?P<focus>.+)",
+        r"(?:my\s+go(?:-|\s)?to(?:\s+\w+)?\s+is)\s+(?P<focus>.+)",
+        r"(?P<focus>[A-Za-z0-9.+-]+)\s+is\s+my\s+go(?:-|\s)?to(?:\s+\w+)?",
         r"(?:lets use|let's use|use|using|go with|choose|chose|chosen|picked|decided to use|switch to|move to|migrate to)\s+(?P<focus>.+)",
     )
     for pattern in patterns:
@@ -693,7 +745,7 @@ def _infer_observed_node_type(text: str) -> NodeType | None:
         return None
     if stripped.endswith("?") or _QUESTION_PREFIX_RE.match(lowered):
         return NodeType.QUESTION
-    if _PREFERENCE_RE.search(stripped):
+    if _PREFERENCE_RE.search(stripped) or _ALWAYS_USE_RE.search(stripped) or _GO_TO_PREFERENCE_RE.search(stripped):
         return NodeType.PREFERENCE
     if _DECISION_RE.search(stripped) or _SWITCH_RE.search(stripped):
         return NodeType.DECISION
@@ -720,6 +772,34 @@ def _normalize_observed_sentence(text: str, *, speaker: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_statement(sentence: str) -> str:
+    normalized = sentence.strip()
+    if not normalized:
+        return ""
+    if not normalized.endswith("."):
+        normalized = f"{normalized}."
+    return normalized
+
+
+def _label_for_choice_with_context(*, token: str, sentence: str) -> str:
+    lowered = normalize_text(sentence)
+    if any(keyword in lowered for keyword in ("cache", "caching")):
+        return "Cache decision"
+    if any(keyword in lowered for keyword in ("backend", "api server")):
+        return "Backend framework decision"
+    if any(keyword in lowered for keyword in ("frontend", "ui")):
+        return "Frontend framework decision"
+    if any(keyword in lowered for keyword in ("auth", "authentication")):
+        return "Auth decision"
+    category = _CHOICE_CATEGORY_BY_TOKEN.get(token.lower())
+    return {
+        "database": "Database decision",
+        "backend-framework": "Backend framework decision",
+        "frontend-framework": "Frontend framework decision",
+        "auth-mechanism": "Auth decision",
+    }.get(category or "", infer_label(sentence))
+
+
 def _extract_structured_observation_candidates(sentence: str, *, speaker: str) -> list[dict[str, object]]:
     tags = ["observed", f"speaker:{speaker}"]
     candidates: list[dict[str, object]] = []
@@ -727,6 +807,67 @@ def _extract_structured_observation_candidates(sentence: str, *, speaker: str) -
 
     if sentence.strip().endswith("?") or _QUESTION_PREFIX_RE.match(lowered):
         return candidates
+
+    if _HEDGED_RE.search(sentence) and (_DECISION_RE.search(sentence) or _PREFERENCE_RE.search(sentence) or _ALWAYS_USE_RE.search(sentence) or _GO_TO_PREFERENCE_RE.search(sentence) or _REVISIT_RE.search(sentence)):
+        hedge_tags = [*tags, "hedged"]
+        if _CONDITIONAL_RE.search(sentence):
+            hedge_tags.append("conditional")
+        candidates.append(
+            {
+                "label": infer_label(sentence),
+                "content": _normalize_statement(sentence),
+                "node_type": NodeType.NOTE,
+                "tags": hedge_tags,
+            }
+        )
+        return candidates
+
+    negated_use_match = _NEGATED_USE_RE.search(sentence)
+    if negated_use_match:
+        token = (negated_use_match.group("token") or negated_use_match.group("token_no_longer") or "").lower()
+        if token:
+            candidate_tags = [*tags, "negated", f"choice:{token}"]
+            if category := _CHOICE_CATEGORY_BY_TOKEN.get(token):
+                candidate_tags.append(category)
+            candidates.append(
+                {
+                    "label": _label_for_choice_with_context(token=token, sentence=sentence),
+                    "content": _normalize_statement(sentence),
+                    "node_type": NodeType.DECISION,
+                    "tags": candidate_tags,
+                }
+            )
+            return candidates
+
+    so_parts = _SO_SPLIT_RE.split(sentence, maxsplit=1)
+    if len(so_parts) == 2:
+        premise, consequence = so_parts[0].strip().rstrip(","), so_parts[1].strip()
+        if premise and consequence and (_DECISION_RE.search(consequence) or _SWITCH_RE.search(consequence)):
+            decision_tags = [*tags]
+            choice = extract_choice_entity(consequence)
+            if choice is not None:
+                entity_token, category = choice
+                decision_tags.extend([category, f"choice:{entity_token}"])
+                decision_label = _label_for_choice_with_context(token=entity_token, sentence=consequence)
+            else:
+                decision_label = infer_label(consequence)
+            candidates.append(
+                {
+                    "label": infer_label(premise),
+                    "content": _normalize_statement(premise),
+                    "node_type": NodeType.FACT,
+                    "tags": [*tags, "decision-rationale"],
+                }
+            )
+            candidates.append(
+                {
+                    "label": decision_label,
+                    "content": _normalize_statement(consequence),
+                    "node_type": NodeType.DECISION,
+                    "tags": decision_tags,
+                }
+            )
+            return candidates
 
     backend_match = _BACKEND_RE.search(sentence)
     if backend_match:
@@ -793,15 +934,8 @@ def _extract_structured_observation_candidates(sentence: str, *, speaker: str) -
     choice = extract_choice_entity(sentence)
     if choice is not None and (_DECISION_RE.search(sentence) or _SWITCH_RE.search(sentence)):
         entity_token, category = choice
-        label = {
-            "database": "Database decision",
-            "backend-framework": "Backend framework decision",
-            "frontend-framework": "Frontend framework decision",
-            "auth-mechanism": "Auth decision",
-        }.get(category, infer_label(sentence))
-        decision_content = sentence.strip()
-        if not decision_content.endswith("."):
-            decision_content = f"{decision_content}."
+        label = _label_for_choice_with_context(token=entity_token, sentence=sentence)
+        decision_content = _normalize_statement(sentence)
         candidates.append(
             {
                 "label": label,
