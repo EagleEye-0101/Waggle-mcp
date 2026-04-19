@@ -36,6 +36,7 @@ If you want a slimmer repo in the future, the recommended split is:
 | `benchmarks/fixtures/dedup_cases.json` | 22 node pairs (11 true-dup, 11 false-friend) |
 | `benchmarks/fixtures/comparative_eval.json` | 27 multi-session scenarios, 66 retrieval queries |
 | `tests/artifacts/verification/2026-04-18-readme-claims/README.md` | Dated verification snapshot for README benchmark claims |
+| `tests/artifacts/verification/2026-04-20-performance-snapshot/performance_snapshot.md` | Dated local operation latency snapshot used by README performance table |
 | `tests/artifacts/context_handoff_dogfood.md` | Example query-mode handoff bundle for the Waggle project |
 | `tests/artifacts/context_handoff_dogfood.json` | Machine-readable version of the same handoff bundle |
 

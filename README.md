@@ -8,6 +8,10 @@
 </p>
 
 <p align="center">
+  <em>Waggle is not a code indexer. It's a conversational memory engine — it remembers what you decided, why, and what changed, across every session.</em>
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/waggle-mcp"><img src="https://img.shields.io/pypi/v/waggle-mcp?color=39d5cf&label=pypi" alt="PyPI"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
   <img src="https://img.shields.io/badge/MCP-compatible-brightgreen" alt="MCP compatible"/>
@@ -25,7 +29,7 @@
 ## What's New — v0.1.7
 
 - **Benchmark harness**: end-to-end `WaggleAdapter` connecting the graph engine to ConvoMem / MemBench runners with automated exact-match scoring and latency logging.
-- **LongMemEval integration**: CLI-driven ingestion and retrieval evaluation against the official LongMemEval split (held-out `81.6% R@5`).
+- **LongMemEval integration**: CLI-driven retrieval evaluation against the official LongMemEval split (`97.4% R@5` / `88.2% Exact@5` in `graph_raw`, `96.4%` / `85.6%` in `graph_hybrid`).
 - **Logging utilities**: structured log helpers (`logging_utils`) for consistent, level-aware output across all subsystems.
 - **Evidence tracking**: new `evidence.py` module records source provenance on stored nodes so reasoning chains are fully traceable.
 - **Observability stack**: Grafana dashboard, Prometheus config, and Docker Compose overlay in `deploy/observability/`.
@@ -57,6 +61,18 @@ Both paths share the same MCP tool surface — the difference is only the backen
 | "What changed?" requires replaying logs | Temporal queries and diffs are first-class |
 
 Waggle often uses materially fewer tokens than naive chunked retrieval on factual lookups, while graph-traversal queries intentionally spend more context to include reasoning chains such as updates, contradictions, and dependencies.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["MCP Client\n(Claude/Cursor/Codex/Antigravity)"] --> S["waggle.server\nMCP tool surface"]
+  S --> G["Graph Engine\nMemoryGraph / Neo4jMemoryGraph"]
+  G --> DB["SQLite (local default)\nor Neo4j (service mode)"]
+  G --> E["Embeddings\n(sentence-transformers or deterministic fallback)"]
+```
 
 ---
 
@@ -190,7 +206,14 @@ Then open a **fresh session** and ask:
 
 > *"What database are we using?"*
 
-If it remembers — you're live. 🎉
+Expected result (example):
+
+```text
+You decided on PostgreSQL for this project.
+Reason captured: MySQL replication had been painful.
+```
+
+If you see that kind of recall in a new session, you're live.
 
 ### Quick-reference tool table
 
@@ -255,6 +278,15 @@ waggle-mcp features
 
 ## See it in action
 
+![Waggle init demo](./assets/demo.svg)
+
+### How It Works (Interaction Flow)
+
+```text
+User  -> Agent -> observe_conversation(...) -> Graph stores typed nodes + edges
+User  -> Agent -> query_graph("database")    -> Subgraph returned -> Agent answers with linked rationale
+```
+
 **Session 1** — April 10
 ```text
 User:  Let's use PostgreSQL. MySQL replication has been painful.
@@ -281,6 +313,22 @@ Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
        → both positions are preserved, and the contradiction is explicit
 ```
 
+### Knowledge graph visual (example)
+
+```mermaid
+graph TD
+  D1["Decision: Use PostgreSQL"]
+  R1["Reason: MySQL replication pain"]
+  D2["Decision update: reconsider MySQL"]
+  P1["Preference: dark mode UI"]
+  N1["Note: add integration tests"]
+
+  D1 -- "depends_on" --> R1
+  D2 -- "contradicts" --> D1
+  N1 -- "relates_to" --> D2
+  P1 -- "part_of project context" --> D1
+```
+
 ---
 
 ## Key Features
@@ -293,23 +341,99 @@ Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
 
 ---
 
+## Security & Privacy
+
+By default, data stays local on your machine (`sqlite` backend, local database path such as `~/.waggle/memory.db`).  
+Waggle does not require telemetry or cloud calls for core local operation.  
+Your conversation memory only leaves your machine if you explicitly configure a remote backend or remote infrastructure.
+
+---
+
+## Graph Data Model
+
+### Node Types
+
+`fact`, `entity`, `concept`, `preference`, `decision`, `question`, `note`
+
+### Edge Types
+
+`relates_to`, `contradicts`, `depends_on`, `part_of`, `updates`, `derived_from`, `similar_to`
+
+---
+
+## Model Support
+
+Waggle currently uses a local `sentence-transformers` embedding model selected by `WAGGLE_MODEL`.
+
+- Default: `all-MiniLM-L6-v2`
+- Any locally available `sentence-transformers` model name can be used.
+- If the selected model is unavailable locally, Waggle falls back to deterministic embeddings for portability.
+
+Set model in env:
+
+```bash
+WAGGLE_MODEL=all-mpnet-base-v2 waggle-mcp serve
+```
+
+Set model in MCP client config (example):
+
+```json
+{
+  "mcpServers": {
+    "waggle": {
+      "command": "python",
+      "args": ["-m", "waggle.server"],
+      "env": {
+        "WAGGLE_MODEL": "all-mpnet-base-v2"
+      }
+    }
+  }
+}
+```
+
+Notes:
+- Waggle does not currently route to hosted embedding providers directly; embedding inference is local to the runtime.
+- Deterministic mode is useful for offline/testing portability, but semantic retrieval quality is lower than transformer mode.
+
+---
+
+## Performance Snapshot
+
+| Operation | Time | Notes |
+|---|---:|---|
+| `observe_conversation` | ~1.54 ms (mean) | Single conversation turn ingestion, local `sqlite` + deterministic embeddings |
+| `query_graph` | ~1.60 ms (mean) | Subgraph retrieval (`max_nodes=12`, `max_depth=2`) |
+| `graph_diff` | ~0.80 ms (mean) | Temporal diff over local graph |
+| Context tokens (comparative mean) | `56.3` vs `150.2` | Waggle vs naive RAG baseline (`~2.7x` lower-token) |
+
+Sources: [performance_snapshot.md](./tests/artifacts/verification/2026-04-20-performance-snapshot/performance_snapshot.md), [benchmark_current.md](./tests/artifacts/benchmark_current.md)
+
+---
+
 ## Benchmarks & Verification
 
 ### External Benchmark — LongMemEval
 
-**`81.6% R@5` on the held-out split (500 questions).** This is the number that matters for generalization — it was not used during development.
+LongMemEval session-retrieval results (500 questions):
 
-The full-split ceiling is `97.4% R@5` (retrieval on the saved benchmark setup), included for completeness in [tests/artifacts/README.md](./tests/artifacts/README.md). The gap reflects the difference between in-distribution retrieval and held-out generalization — both numbers are real, the held-out one is the honest one.
+| Method | R@5 | Exact@5 | Notes |
+|------|-----|---------|-------|
+| `graph_raw` | `97.4%` | `88.2%` | Full split, no second-stage reranking (`13/500` misses). Source: [`results_graph_raw.json`](./benchmarks/longmemeval/results_graph_raw.json) |
+| `graph_hybrid` | `96.4%` | `85.6%` | Full split with hybrid reranking (`18/500` misses). Source: [`results_graph_hybrid.json`](./benchmarks/longmemeval/results_graph_hybrid.json) |
+
+`Exact@5` is stricter than R@5 and is included here to show precision on support-session retrieval, not just any top-5 hit.
+
+**Important:** on the current saved artifacts, raw retrieval outperforms hybrid reranking on both R@5 and Exact@5. We are treating this as a tuning target for `v0.1.8` rather than changing defaults to a weaker mode.
 
 ### Internal Fixtures
 
 | Area | Corpus | Result |
 |------|--------|--------|
-| Extraction | 25-case deterministic fixture | `100.0%` |
-| Retrieval | 18-query retrieval fixture | `83.3% Hit@k` |
-| Query stress | 40 adversarial retrieval-only cases | `97.5% Hit@k`, `97.5% exact support` |
-| Deduplication | 22 cases (semi-semantic) | `0` false merges at threshold; `77.3%` overall (conservative false negatives — improving in 0.1.8) |
-| Automated tests | Infrastructure & logic | `91 passed` |
+| Extraction | 25-case deterministic fixture | `100.0%` (source: [`benchmark_current.md`](./tests/artifacts/benchmark_current.md)) |
+| Retrieval | 18-query retrieval fixture | `83.3% Hit@k` (source: [`benchmark_current.md`](./tests/artifacts/benchmark_current.md)) |
+| Query stress | 40 adversarial retrieval-only cases | `97.5% Hit@k`, `97.5% exact support` (source: [`benchmark_current.md`](./tests/artifacts/benchmark_current.md)) |
+| Deduplication | 22 cases (semi-semantic) | `0` false merges at threshold; `77.3%` overall (source: [`benchmark_current.md`](./tests/artifacts/benchmark_current.md)) |
+| Automated tests | Infrastructure & logic | `91 passed` (source: [`pytest_test_benchmark_harness.txt`](./tests/artifacts/verification/2026-04-18-readme-claims/pytest_test_benchmark_harness.txt)) |
 
 **Deduplication note:** Zero false-positive merges is the safety invariant. The 77.3% overall accuracy is intentionally conservative — the system prefers a missed merge over a wrong merge. Improving recall without introducing false positives is the active work for 0.1.8.
 
