@@ -377,16 +377,11 @@ LongMemEval session-retrieval results (500 questions):
 
 **Important:** on the current saved artifacts, raw retrieval outperforms hybrid reranking on both R@5 and Exact@5. We are treating this as a tuning target for `v0.1.8` rather than changing defaults to a weaker mode.
 
-### Cross-Project Context (LongMemEval, session retrieval)
+### Benchmark Policy
 
-| System | R@5 | Notes |
-|------|-----|-------|
-| Waggle (`graph_raw`) | `97.4%` | Graph traversal, no reranking |
-| MemPalace | `96.6%` | Semantic search, no LLM |
-| Supermemory | `81.6%` | Self-reported |
-| Vektori | `73%` | LongMemEval-S, gemini-flash-lite |
-
-⚠️ Methodologies differ across projects. We encourage running your own evals. See [tests/artifacts/README.md](./tests/artifacts/README.md) for our setup.
+README benchmark claims in this repo are limited to Waggle runs with checked-in artifacts and reproducible commands.  
+Cross-project comparisons are intentionally excluded here unless they are strictly apples-to-apples on split, protocol, and scoring.
+For exact setup details and verification snapshots, see [tests/artifacts/README.md](./tests/artifacts/README.md).
 
 ### Internal Fixtures
 
