@@ -91,6 +91,18 @@ def test_store_node_and_stats_tool(tmp_path: Path) -> None:
     assert stats_result.structuredContent["total_nodes"] == 1
 
 
+def test_tool_schemas_are_glama_friendly(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+
+    for tool in app.build_tools():
+        assert tool.description
+        assert tool.inputSchema["type"] == "object"
+        assert tool.inputSchema["additionalProperties"] is False
+        assert isinstance(tool.inputSchema["properties"], dict)
+        for field_name, field_schema in tool.inputSchema["properties"].items():
+            assert field_schema.get("description"), f"{tool.name}.{field_name} is missing a description"
+
+
 def test_export_graph_html_tool(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     app.handle_tool_call(

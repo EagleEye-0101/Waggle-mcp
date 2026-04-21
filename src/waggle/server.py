@@ -96,6 +96,41 @@ REQUIRED_RUNTIME_METHODS = (
 )
 
 
+def _object_input_schema(
+    properties: dict[str, Any] | None = None,
+    *,
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties or {},
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _scope_properties() -> dict[str, dict[str, Any]]:
+    return {
+        "agent_id": {
+            "type": "string",
+            "default": "",
+            "description": "Optional agent or client identifier used to partition memory.",
+        },
+        "project": {
+            "type": "string",
+            "default": "",
+            "description": "Optional project or workspace name used to partition memory.",
+        },
+        "session_id": {
+            "type": "string",
+            "default": "",
+            "description": "Optional conversation or run identifier used to partition memory.",
+        },
+    }
+
+
 def _assert_runtime_feature_parity() -> None:
     missing = [name for name in REQUIRED_RUNTIME_METHODS if not hasattr(MemoryGraph, name)]
     if not missing:
@@ -181,9 +216,8 @@ class WaggleServer:
                     "Call this whenever you learn something important from the user: facts, "
                     "preferences, decisions, entities, concepts, or questions. Prefer atomic facts."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
+                inputSchema=_object_input_schema(
+                    {
                         "label": {"type": "string", "description": "Short label for the knowledge being stored."},
                         "content": {"type": "string", "description": "Full natural-language description for this node."},
                         "node_type": {
@@ -202,12 +236,10 @@ class WaggleServer:
                             "description": "Optional original prompt that produced this knowledge.",
                             "default": "",
                         },
-                        "agent_id": {"type": "string", "default": ""},
-                        "project": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
+                        **_scope_properties(),
                     },
-                    "required": ["label", "content", "node_type"],
-                },
+                    required=["label", "content", "node_type"],
+                ),
             ),
             types.Tool(
                 name="store_edge",
@@ -215,9 +247,8 @@ class WaggleServer:
                     "Create a relationship between two stored nodes. Use this immediately after "
                     "storing related nodes so the memory graph preserves structure, updates, and conflicts."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
+                inputSchema=_object_input_schema(
+                    {
                         "source_id": {"type": "string", "description": "Source node ID."},
                         "target_id": {"type": "string", "description": "Target node ID."},
                         "relationship": {
@@ -233,8 +264,8 @@ class WaggleServer:
                             "description": "Optional strength of the relationship.",
                         },
                     },
-                    "required": ["source_id", "target_id", "relationship"],
-                },
+                    required=["source_id", "target_id", "relationship"],
+                ),
             ),
             types.Tool(
                 name="query_graph",
@@ -243,233 +274,390 @@ class WaggleServer:
                     "Returns a serialized subgraph with matching nodes and their connected neighborhood. "
                     "Understands temporal references such as 'recently', 'latest', 'originally', and 'last week'."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
+                inputSchema=_object_input_schema(
+                    {
                         "query": {"type": "string", "description": "Natural-language search query."},
-                        "max_nodes": {"type": "integer", "default": 20, "minimum": 1},
-                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
-                        "agent_id": {"type": "string", "default": ""},
-                        "project": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
+                        "max_nodes": {
+                            "type": "integer",
+                            "default": 20,
+                            "minimum": 1,
+                            "description": "Maximum number of matching nodes to return.",
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth around matching nodes.",
+                        },
+                        **_scope_properties(),
                         "retrieval_mode": {
                             "type": "string",
                             "enum": ["graph", "replay", "fusion"],
                             "default": "graph",
+                            "description": "Retrieval strategy: graph-only, transcript replay, or fused graph plus replay results.",
                         },
                     },
-                    "required": ["query"],
-                },
+                    required=["query"],
+                ),
             ),
             types.Tool(
                 name="get_related",
-                description="Get all nodes connected to a specific node up to a configurable depth.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "node_id": {"type": "string"},
-                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
+                description=(
+                    "Fetch the neighborhood around a specific memory node. Use when you already have a node ID "
+                    "and need its connected context. Returns matching nodes and edges as a serialized subgraph."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "node_id": {"type": "string", "description": "ID of the node whose neighborhood should be returned."},
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth from the starting node.",
+                        },
                     },
-                    "required": ["node_id"],
-                },
+                    required=["node_id"],
+                ),
             ),
             types.Tool(
                 name="get_node_history",
-                description="Inspect one node's evidence, validity window, and connected context.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "node_id": {"type": "string"},
-                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
+                description=(
+                    "Inspect one memory node's evidence, validity window, and connected context. Use when auditing "
+                    "why a memory exists or how it changed. Returns the node, evidence records, related nodes, and edges."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "node_id": {"type": "string", "description": "ID of the node to inspect."},
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth for related context.",
+                        },
                     },
-                    "required": ["node_id"],
-                },
+                    required=["node_id"],
+                ),
             ),
             types.Tool(
                 name="list_context_scopes",
-                description="List known agent, project, and session scopes stored in the current tenant graph.",
-                inputSchema={"type": "object", "properties": {}},
+                description=(
+                    "List known agent, project, and session scope values stored in the current tenant graph. "
+                    "Use before filtering memory by scope. Returns arrays of scope identifiers."
+                ),
+                inputSchema=_object_input_schema(),
             ),
             types.Tool(
                 name="timeline",
-                description="Build a chronological view of memory changes for a node, a query result, or the tenant.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "node_id": {"type": "string"},
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer", "default": 25, "minimum": 1},
-                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
-                        "include_evidence": {"type": "boolean", "default": True},
+                description=(
+                    "Build a chronological view of memory changes for a node, a query result, or the whole tenant. "
+                    "Use when order and evidence matter. Returns timestamped timeline items."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "node_id": {"type": "string", "description": "Optional node ID to anchor the timeline."},
+                        "query": {"type": "string", "description": "Optional natural-language query to select relevant memories."},
+                        "limit": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of timeline items to return.",
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth when a node ID or query is supplied.",
+                        },
+                        "include_evidence": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether to include evidence records alongside node and edge events.",
+                        },
                     },
-                },
+                ),
             ),
             types.Tool(
                 name="list_conflicts",
-                description="List contradiction and update edges, with unresolved conflicts shown by default.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "include_resolved": {"type": "boolean", "default": False},
-                        "limit": {"type": "integer", "default": 25, "minimum": 1},
+                description=(
+                    "List contradiction and update edges, with unresolved conflicts shown by default. "
+                    "Use to review memory disagreements before resolving them. Returns conflict entries with source and target nodes."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "include_resolved": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Whether to include conflicts that were already marked resolved.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of conflicts to return.",
+                        },
                     },
-                },
+                ),
             ),
             types.Tool(
                 name="resolve_conflict",
-                description="Mark a contradiction or update edge as resolved without deleting the underlying history.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "edge_id": {"type": "string"},
-                        "resolution_note": {"type": "string", "default": ""},
+                description=(
+                    "Mark a contradiction or update edge as resolved without deleting the underlying history. "
+                    "Use after deciding how competing memories should be interpreted. Returns the resolved conflict entry."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "edge_id": {"type": "string", "description": "ID of the conflict edge to mark resolved."},
+                        "resolution_note": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Optional human-readable note explaining the resolution.",
+                        },
                     },
-                    "required": ["edge_id"],
-                },
+                    required=["edge_id"],
+                ),
             ),
             types.Tool(
                 name="update_node",
-                description="Update an existing node's content or metadata.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "node_id": {"type": "string"},
-                        "content": {"type": "string"},
-                        "label": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
+                description=(
+                    "Update an existing memory node's content, label, or tags. Use when a stored memory needs correction "
+                    "without deleting its identity. Returns the updated node."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "node_id": {"type": "string", "description": "ID of the node to update."},
+                        "content": {"type": "string", "description": "Replacement natural-language content for the node."},
+                        "label": {"type": "string", "description": "Replacement short label for the node."},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Replacement tag list for the node.",
+                        },
                     },
-                    "required": ["node_id"],
-                },
+                    required=["node_id"],
+                ),
             ),
             types.Tool(
                 name="delete_node",
                 description="Delete a node and all connected edges from persistent memory.",
-                inputSchema={"type": "object", "properties": {"node_id": {"type": "string"}}, "required": ["node_id"]},
+                inputSchema=_object_input_schema(
+                    {"node_id": {"type": "string", "description": "ID of the node to delete."}},
+                    required=["node_id"],
+                ),
             ),
             types.Tool(
                 name="decompose_and_store",
-                description="Break long or complex content into atomic nodes, store them automatically, and create inferred edges.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string"},
-                        "context": {"type": "string", "default": ""},
+                description=(
+                    "Break long or complex content into atomic memory nodes, store them automatically, and create inferred edges. "
+                    "Use for notes, summaries, or multi-fact passages. Returns the stored subgraph."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "content": {"type": "string", "description": "Long-form content to decompose into memory nodes."},
+                        "context": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Optional background that helps classify and connect extracted memories.",
+                        },
                     },
-                    "required": ["content"],
-                },
+                    required=["content"],
+                ),
             ),
             types.Tool(
                 name="observe_conversation",
-                description="Observe a completed conversation turn, extract important information, and store it automatically.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "user_message": {"type": "string"},
-                        "assistant_response": {"type": "string"},
-                        "agent_id": {"type": "string", "default": ""},
-                        "project": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
+                description=(
+                    "Observe a completed conversation turn, extract important information, and store it automatically. "
+                    "Use after user-assistant turns that contain preferences, decisions, facts, or tasks. Returns stored nodes and conflicts."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "user_message": {"type": "string", "description": "The user's message from the completed turn."},
+                        "assistant_response": {"type": "string", "description": "The assistant's response from the completed turn."},
+                        **_scope_properties(),
                     },
-                    "required": ["user_message", "assistant_response"],
-                },
+                    required=["user_message", "assistant_response"],
+                ),
             ),
             types.Tool(
                 name="graph_diff",
-                description="Show what changed in the graph recently, including added or updated nodes and created edges.",
-                inputSchema={"type": "object", "properties": {"since": {"type": "string", "default": "24h"}}},
+                description=(
+                    "Show what changed in the memory graph recently, including added nodes, updated nodes, created edges, "
+                    "and contradiction edges. Use for review or handoff. Returns a serialized graph diff."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "since": {
+                            "type": "string",
+                            "default": "24h",
+                            "description": "Lookback window such as '24h', '7d', or an ISO-like timestamp.",
+                        }
+                    }
+                ),
             ),
             types.Tool(
                 name="prime_context",
-                description="Build a compact context brief for the start of a new conversation.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project": {"type": "string", "default": ""},
-                        "agent_id": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
-                    },
-                },
+                description=(
+                    "Build a compact context brief for the start of a new conversation. "
+                    "Use to hydrate an assistant with the most relevant scoped memories. Returns summary text plus nodes and edges."
+                ),
+                inputSchema=_object_input_schema(_scope_properties()),
             ),
             types.Tool(
                 name="get_topics",
-                description="Detect topic clusters in the graph using community detection and return the main themes.",
-                inputSchema={"type": "object", "properties": {}},
+                description=(
+                    "Detect topic clusters in the graph using community detection. Use to understand the main themes "
+                    "in memory. Returns labeled clusters with representative nodes and tags."
+                ),
+                inputSchema=_object_input_schema(),
             ),
-            types.Tool(name="get_stats", description="Return high-level statistics about the current memory graph.", inputSchema={"type": "object", "properties": {}}),
+            types.Tool(
+                name="get_stats",
+                description=(
+                    "Return high-level statistics about the current memory graph. Use for health checks or quick summaries. "
+                    "Returns node and edge counts, node type breakdowns, and recent or highly connected nodes."
+                ),
+                inputSchema=_object_input_schema(),
+            ),
             types.Tool(
                 name="export_graph_html",
-                description="Export the current memory graph as an interactive HTML visualization.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "output_path": {"type": "string"},
-                        "include_physics": {"type": "boolean", "default": True},
+                description=(
+                    "Export the current memory graph as an interactive HTML visualization. "
+                    "Use when a human needs to inspect the graph visually. Returns the output path and graph counts."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional destination HTML file path. If omitted, Waggle chooses an export path.",
+                        },
+                        "include_physics": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether the visualization should use physics-based node layout.",
+                        },
                     },
-                },
+                ),
             ),
             types.Tool(
                 name="export_graph_backup",
-                description="Export the current graph as a portable JSON backup.",
-                inputSchema={"type": "object", "properties": {"output_path": {"type": "string"}}},
+                description=(
+                    "Export the current graph as a portable JSON backup. Use for migration, restore drills, or offline archive. "
+                    "Returns backup path, schema version, and object counts."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional destination JSON file path. If omitted, Waggle chooses an export path.",
+                        }
+                    }
+                ),
             ),
             types.Tool(
                 name="export_context_bundle",
-                description="Export a portable Markdown/JSON context bundle for handing memory to another AI.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "mode": {"type": "string", "enum": ["prime", "query", "graph"], "default": "prime"},
-                        "query": {"type": "string"},
-                        "project": {"type": "string", "default": ""},
-                        "agent_id": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
-                        "max_nodes": {"type": "integer", "default": 25},
-                        "max_depth": {"type": "integer", "default": 2},
+                description=(
+                    "Export a portable Markdown and/or JSON context bundle for handing memory to another AI or a human. "
+                    "Use for cross-tool context transfer, audits, and resumable work. Returns file paths, counts, and render hints."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["prime", "query", "graph"],
+                            "default": "prime",
+                            "description": "Bundle selection mode: scoped prime context, query result, or broad graph export.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Natural-language query used when mode is 'query'.",
+                        },
+                        **_scope_properties(),
+                        "max_nodes": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of nodes to include.",
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Relationship traversal depth for query or prime context modes.",
+                        },
                         "retrieval_mode": {
                             "type": "string",
                             "enum": ["graph", "replay", "fusion"],
                             "default": "graph",
+                            "description": "Retrieval strategy for query mode: graph-only, transcript replay, or fused results.",
                         },
-                        "format": {"type": "string", "enum": ["markdown", "json", "both"], "default": "both"},
-                        "output_path": {"type": "string"},
-                        "include_edges": {"type": "boolean", "default": True},
-                        "include_timestamps": {"type": "boolean", "default": True},
-                        "include_source_prompt": {"type": "boolean", "default": False},
-                        "audience": {"type": "string", "enum": ["llm", "human"], "default": "llm"},
+                        "format": {
+                            "type": "string",
+                            "enum": ["markdown", "json", "both"],
+                            "default": "both",
+                            "description": "Output format to write.",
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional destination file path or directory prefix for the bundle.",
+                        },
+                        "include_edges": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether relationship edges should be included in the export.",
+                        },
+                        "include_timestamps": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether created and updated timestamps should be included.",
+                        },
+                        "include_source_prompt": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Whether original source prompts should be included when available.",
+                        },
+                        "audience": {
+                            "type": "string",
+                            "enum": ["llm", "human"],
+                            "default": "llm",
+                            "description": "Target audience used to tune bundle rendering.",
+                        },
                     },
-                },
+                ),
             ),
             types.Tool(
                 name="import_graph_backup",
-                description="Import a portable JSON graph backup into the current backend.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {"input_path": {"type": "string"}},
-                    "required": ["input_path"],
-                },
+                description=(
+                    "Import a portable JSON graph backup into the current backend. Use for restores or migrations. "
+                    "Returns counts for created and updated nodes and edges."
+                ),
+                inputSchema=_object_input_schema(
+                    {"input_path": {"type": "string", "description": "Path to the JSON backup file to import."}},
+                    required=["input_path"],
+                ),
             ),
             types.Tool(
                 name="export_markdown_vault",
-                description="Export the current graph as an Obsidian-compatible Markdown vault.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "root_path": {"type": "string"},
-                        "project": {"type": "string", "default": ""},
-                        "agent_id": {"type": "string", "default": ""},
-                        "session_id": {"type": "string", "default": ""},
+                description=(
+                    "Export the current graph as an Obsidian-compatible Markdown vault. "
+                    "Use when a human wants browsable note files with graph links. Returns written files and graph counts."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "root_path": {"type": "string", "description": "Destination directory for the Markdown vault."},
+                        **_scope_properties(),
                     },
-                    "required": ["root_path"],
-                },
+                    required=["root_path"],
+                ),
             ),
             types.Tool(
                 name="import_markdown_vault",
-                description="Import an Obsidian-compatible Markdown vault into the current graph non-destructively.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {"root_path": {"type": "string"}},
-                    "required": ["root_path"],
-                },
+                description=(
+                    "Import an Obsidian-compatible Markdown vault into the current graph non-destructively. "
+                    "Use to sync edited vault notes back into memory. Returns created, updated, deleted-edge, and conflict counts."
+                ),
+                inputSchema=_object_input_schema(
+                    {"root_path": {"type": "string", "description": "Source directory of the Markdown vault to import."}},
+                    required=["root_path"],
+                ),
             ),
         ]
 
