@@ -659,5 +659,36 @@ def test_write_codex_config_no_longer_uses_pythonpath(monkeypatch: pytest.Monkey
     config_path = _write_codex(str(tmp_path / "memory.db"), "/tmp/fake-python")
     contents = config_path.read_text()
 
+    assert config_path == tmp_path / ".codex" / "config.toml"
     assert "PYTHONPATH" not in contents
     assert 'args = ["-m", "waggle.server"]' in contents
+    assert '[mcp_servers.waggle.env]' in contents
+
+
+def test_write_codex_config_updates_existing_file_without_duplicates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        '[profile.default]\n'
+        'model = "gpt-5.4"\n\n'
+        '[mcp_servers.waggle]\n'
+        'command = "/old/python"\n'
+        'args = ["-m", "waggle.server"]\n\n'
+        '[mcp_servers.waggle.env]\n'
+        'WAGGLE_DB_PATH = "/old/memory.db"\n\n'
+        '[mcp_servers.playwright]\n'
+        'command = "npx"\n'
+    )
+
+    config_path = _write_codex(str(tmp_path / "memory.db"), "/tmp/fake-python")
+    contents = config_path.read_text()
+
+    assert contents.count("[mcp_servers.waggle]") == 1
+    assert contents.count("[mcp_servers.waggle.env]") == 1
+    assert '[profile.default]\nmodel = "gpt-5.4"' in contents
+    assert '[mcp_servers.playwright]\ncommand = "npx"' in contents
+    assert 'command = "/tmp/fake-python"' in contents
+    assert f'WAGGLE_DB_PATH = "{tmp_path / "memory.db"}"' in contents
+    assert "/old/python" not in contents
+    assert "/old/memory.db" not in contents

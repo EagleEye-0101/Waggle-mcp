@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1937,21 +1938,33 @@ def _write_cursor(db_path: str, python_exe: str) -> Path:
 
 
 def _write_codex(db_path: str, python_exe: str) -> Path:
-    """Write ~/codex_mcp.toml (printable TOML snippet — Codex uses a TOML file)."""
-    config_file = Path.home() / "codex_mcp.toml"
+    """Write or update the Waggle MCP server block in ~/.codex/config.toml."""
+    config_dir = Path.home() / ".codex"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "config.toml"
     toml_block = (
         '[mcp_servers.waggle]\n'
         f'command = "{python_exe}"\n'
         'args = ["-m", "waggle.server"]\n'
-        'env = {\n'
-        '  WAGGLE_TRANSPORT = "stdio",\n'
-        '  WAGGLE_BACKEND = "sqlite",\n'
-        f'  WAGGLE_DB_PATH = "{db_path}",\n'
-        '  WAGGLE_DEFAULT_TENANT_ID = "local-default",\n'
-        '  WAGGLE_MODEL = "all-MiniLM-L6-v2"\n'
-        '}\n'
+        '\n'
+        '[mcp_servers.waggle.env]\n'
+        'WAGGLE_TRANSPORT = "stdio"\n'
+        'WAGGLE_BACKEND = "sqlite"\n'
+        f'WAGGLE_DB_PATH = "{db_path}"\n'
+        'WAGGLE_DEFAULT_TENANT_ID = "local-default"\n'
+        'WAGGLE_MODEL = "all-MiniLM-L6-v2"\n'
     )
-    config_file.write_text(toml_block)
+    existing = config_file.read_text() if config_file.exists() else ""
+    pattern = re.compile(
+        r"(?ms)^\[mcp_servers\.waggle\]\n.*?(?=^\[(?!mcp_servers\.waggle(?:\.env)?\])[^\n]+\]\n|\Z)"
+    )
+    replacement = toml_block.rstrip() + "\n"
+    if pattern.search(existing):
+        updated = pattern.sub(replacement, existing, count=1)
+    else:
+        separator = "\n\n" if existing.strip() else ""
+        updated = existing.rstrip() + separator + replacement
+    config_file.write_text(updated)
     return config_file
 
 
@@ -1983,7 +1996,7 @@ _CLIENT_WRITERS = {
 _RESTART_HINTS = {
     "Claude Desktop": "Restart Claude Desktop to activate.",
     "Cursor": "Reload the Cursor window (Cmd/Ctrl+Shift+P → 'Reload Window') to activate.",
-    "Codex": "Copy the TOML block into your Codex config file, then restart Codex.",
+    "Codex": "Restart Codex to activate.",
     "Other": "Add the JSON config to your MCP client's server list, then restart it.",
 }
 
