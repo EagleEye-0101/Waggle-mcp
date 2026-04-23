@@ -237,6 +237,8 @@ The reference implementation is [orchestrator.py](../src/waggle/orchestrator.py)
 - scope isolation via `tenant/project/agent/session/model`
 - concrete chat loop wrapper (`OrchestratedChatRuntime`)
 
+This is the preferred product integration. Exposing MCP tools alone is not enough to make memory automatic. If a session appears to have empty memory, the likely cause is that the client did not load the automatic-memory instructions or the runtime is bypassing `build_context(...)` / `on_assistant_turn(...)`.
+
 The MCP server also exposes this behavior as:
 
 - prompt: `waggle_memory_policy`
@@ -252,6 +254,8 @@ At the start of a new session, if project, agent, or session scope is known, cal
 Before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context, call query_graph with the narrowest relevant scope.
 
 After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
+
+Waggle should remember relevant context automatically. If memory appears empty, the session is likely missing the automatic memory policy or the runtime hooks that call build_context before answers and on_assistant_turn after answers.
 
 Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
 ```

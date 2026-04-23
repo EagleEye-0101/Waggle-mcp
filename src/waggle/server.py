@@ -101,6 +101,7 @@ REQUIRED_RUNTIME_METHODS = (
 MEMORY_AUTOMATION_POLICY = """Waggle automatic memory policy
 
 The user should not manually manage memory. The assistant/runtime is responsible for using Waggle tools.
+Waggle should remember relevant conversational context automatically. If memory looks empty, the likely issue is that this session is not loading the automatic memory policy or is bypassing the orchestrated runtime hooks.
 
 Before answering:
 - Use prime_context at the start of a new session when project, agent, or session scope is known.
@@ -124,6 +125,8 @@ At the start of a new session, if project, agent, or session scope is known, cal
 Before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context, call query_graph with the narrowest relevant scope.
 
 After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
+
+Waggle should remember relevant context automatically. If memory appears empty, the session is likely missing the automatic memory policy or the runtime hooks that call build_context before answers and on_assistant_turn after answers.
 
 Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
 """

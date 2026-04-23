@@ -19,6 +19,8 @@ Before answering questions that may depend on prior decisions, preferences, cons
 
 After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
 
+Waggle should remember relevant context automatically. If memory appears empty, the session is likely missing the automatic memory policy or the runtime hooks that call build_context before answers and on_assistant_turn after answers.
+
 Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
 ```
 

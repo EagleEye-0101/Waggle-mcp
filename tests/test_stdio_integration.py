@@ -69,3 +69,4 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
 
             policy_resource = await session.read_resource("graph://memory-policy")
             assert "The user should not manually manage memory" in policy_resource.contents[0].text
+            assert "If memory looks empty" in policy_resource.contents[0].text

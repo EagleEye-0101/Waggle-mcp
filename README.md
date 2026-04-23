@@ -251,6 +251,8 @@ There is not a better generic repo-side mechanism for third-party MCP clients to
 
 If a client later exposes a native pre-answer / post-turn orchestration hook, that is better than prompt rules. Until then, prompt-level rules are the portable solution across Codex and Antigravity.
 
+For product integrations, the preferred path is the event-driven runtime in [docs/memory-orchestration.md](./docs/memory-orchestration.md): call `build_context(...)` before each answer and `on_assistant_turn(...)` after each completed turn. MCP tool exposure alone does not make memory automatic.
+
 Use the same rule text in:
 - **Codex**: your global/project instructions or equivalent agent rule layer
 - **Antigravity**: **User Rules** / custom instructions for the agent
@@ -267,6 +269,8 @@ At the start of a new session, if project, agent, or session scope is known, cal
 Before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context, call query_graph with the narrowest relevant scope.
 
 After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
+
+Waggle should remember relevant context automatically. If memory appears empty, the session is likely missing the automatic memory policy or the runtime hooks that call build_context before answers and on_assistant_turn after answers.
 
 Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
 ```

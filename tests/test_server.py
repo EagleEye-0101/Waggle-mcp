@@ -118,12 +118,14 @@ def test_memory_policy_prompt_and_resource(tmp_path: Path) -> None:
     prompt_text = prompt_result.messages[0].content.text
 
     assert "The user should not manually manage memory" in prompt_text
+    assert "Waggle should remember relevant conversational context automatically" in prompt_text
     assert "Use query_graph before answering" in prompt_text
     assert "Use observe_conversation after completed turns" in prompt_text
     assert "project: MCP" in prompt_text
 
     resource_text = app.read_resource_text("graph://memory-policy")
     assert "Waggle automatic memory policy" in resource_text
+    assert "If memory looks empty" in resource_text
     assert "Do not call store_node for normal conversation memory" in resource_text
 
 
@@ -725,3 +727,4 @@ def test_write_codex_agents_updates_existing_block_without_duplication(tmp_path:
     assert "old instructions" not in contents
     assert "Keep this note." in contents
     assert AUTOMATIC_MEMORY_RULE_TEXT.strip() in contents
+    assert "build_context before answers and on_assistant_turn after answers" in contents
