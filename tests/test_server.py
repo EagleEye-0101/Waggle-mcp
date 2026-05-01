@@ -124,7 +124,20 @@ def test_parser_accepts_graph_editor_commands() -> None:
     )
     query_args = parser.parse_args(["query", "--input", "memory.abhi", "--query-id", "q1"])
     load_chunks_args = parser.parse_args(["load-chunks", "--input", "memory.abhi", "--chunk-id", "decision_1"])
-    oolong_args = parser.parse_args(["benchmark-oolong", "oolong.jsonl", "--eval-mode", "retrieval_only"])
+    oolong_args = parser.parse_args(
+        [
+            "benchmark-oolong",
+            "oolong.jsonl",
+            "--eval-mode",
+            "waggle_rlm",
+            "--llm-backend",
+            "gemini",
+            "--llm-model",
+            "gemini-2.5-flash-lite",
+            "--llm-api-key-env",
+            "GEMINI_API_KEY",
+        ]
+    )
 
     assert edit_args.command == "edit-graph"
     assert edit_args.port == 8787
@@ -141,7 +154,11 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert load_chunks_args.chunk_ids == ["decision_1"]
     assert oolong_args.command == "benchmark-oolong"
     assert oolong_args.dataset_path == "oolong.jsonl"
-    assert oolong_args.eval_mode == "retrieval_only"
+    assert oolong_args.eval_mode == "waggle_rlm"
+    assert oolong_args.llm_backend == "gemini"
+    assert oolong_args.llm_model == "gemini-2.5-flash-lite"
+    assert oolong_args.llm_api_key_env == "GEMINI_API_KEY"
+    assert oolong_args.rlm_max_iterations == 6
 
 
 def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -178,6 +195,8 @@ def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.
         return FakeReport()
 
     monkeypatch.setattr("waggle.server.evaluate_oolong", fake_evaluate_oolong)
+    monkeypatch.setattr("waggle.server.run_gemini_one_shot", lambda **_: "coffee")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 
     args = SimpleNamespace(
         command="benchmark-oolong",
@@ -186,11 +205,18 @@ def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.
         context_field="auto",
         eval_mode="retrieval_only",
         llm_command="",
+        llm_backend="gemini",
+        llm_model="gemini-2.5-flash-lite",
+        llm_api_key_env="GEMINI_API_KEY",
+        llm_max_tokens=512,
+        llm_timeout_seconds=60.0,
         retrieval_mode="graph",
         max_nodes=8,
         max_depth=1,
         chunk_lines=12,
         chunk_overlap_lines=3,
+        rlm_system_prompt_file="",
+        rlm_max_iterations=6,
         limit=None,
         output="",
     )
@@ -202,6 +228,12 @@ def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.
     assert captured["args"] == ("oolong.jsonl",)
     assert captured["kwargs"]["eval_mode"] == "retrieval_only"
     assert captured["kwargs"]["retrieval_mode"] == "graph"
+    assert callable(captured["kwargs"]["llm_answerer"])
+    assert captured["kwargs"]["rlm_backend"] == "gemini"
+    assert captured["kwargs"]["rlm_backend_kwargs"] == {
+        "api_key": "test-key",
+        "model_name": "gemini-2.5-flash-lite",
+    }
     assert '"accuracy": 1.0' in stdout
 
 

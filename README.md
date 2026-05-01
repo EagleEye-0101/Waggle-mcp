@@ -36,7 +36,8 @@ That demo exercises the full MCP surface: graph ingestion, retrieval, conflict h
 
 - **Graph Studio refresh:** the local `/graph` editor now has collapsible side panels, focus mode, label toggling, connected/isolate/cluster stats, and a layout that handles sparse graphs better instead of dropping everything into a giant ring.
 - **Broader retrieval:** the new `aggregate_graph` MCP tool returns a wide filtered subgraph for map-reduce style analysis, with optional `node_types`, `tags`, and scope filters.
-- **OOLONG evaluation workflow:** `waggle-mcp benchmark-oolong ...` runs retrieval-only or retrieval+LLM evaluation against OOLONG datasets and can emit JSON reports for offline analysis.
+- **OOLONG evaluation workflow:** `waggle-mcp benchmark-oolong ...` runs retrieval-only, one-shot retrieval+LLM, or Waggle-backed RLM evaluation against OOLONG datasets and can emit JSON reports for offline analysis.
+- **Vendored upstream RLM package:** the repo now includes the upstream `alexzhang13/rlm` Python package under [`src/rlm`](./src/rlm/) with attribution material in [`third_party/rlm`](./third_party/rlm/).
 
 ## Who It's For
 
@@ -399,7 +400,7 @@ Waggle includes a built-in CLI for setup, maintenance, and learning the memory s
 | `waggle-mcp init` | Interactive setup wizard to configure one MCP client. |
 | `waggle-mcp serve` | Run the MCP server (usually started automatically by your client). |
 | `waggle-mcp edit-graph` | Launch the local Graph Studio in the browser for direct graph editing and export/import workflows. |
-| `waggle-mcp benchmark-oolong` | Run OOLONG retrieval or retrieval+LLM evaluation against local datasets and emit a JSON report. |
+| `waggle-mcp benchmark-oolong` | Run OOLONG retrieval-only, retrieval+LLM, or Waggle-backed RLM evaluation against local datasets and emit a JSON report. |
 | `waggle-mcp ingest-transcript-handoff` | Ingest a rollover transcript and export a handoff bundle for the next window or IDE. |
 | `waggle-mcp export-context-bundle` | Export a portable Markdown/JSON context pack for another AI. |
 | `waggle-mcp export-markdown-vault` | Export your memory graph as an Obsidian-style vault. |

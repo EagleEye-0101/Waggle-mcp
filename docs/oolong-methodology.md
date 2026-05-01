@@ -23,7 +23,14 @@ The loader supports local exports that look like:
 ## Modes
 
 - `retrieval_only`: runs Waggle retrieval and reports the retrieved bundle size per case, but does not score answer accuracy
-- `waggle_llm`: runs retrieval, builds a benchmark prompt from the retrieved Waggle nodes, sends that prompt to an external command, and scores normalized exact match
+- `waggle_llm`: runs retrieval, builds a benchmark prompt from the retrieved Waggle nodes, sends that prompt to an LLM, and scores normalized exact match
+- `waggle_rlm`: runs an iterative RLM-style loop where the model can search Waggle, inspect specific nodes, and only then answer
+
+`waggle_rlm` is the closest fit for using Waggle as structured memory rather than a flat retrieved bundle. The default system prompt makes the model behave like a small recursive planner over Waggle memory with three actions:
+
+- `search_waggle`
+- `read_node`
+- `answer`
 
 ## CLI
 
@@ -39,9 +46,19 @@ PYTHONPATH=src .venv/bin/python scripts/benchmark_oolong.py /path/to/oolong.json
   --output benchmarks/oolong/results.json
 ```
 
+```bash
+PYTHONPATH=src GROQ_API_KEY=gsk_... .venv/bin/python scripts/benchmark_oolong.py /path/to/oolong.jsonl \
+  --eval-mode waggle_rlm \
+  --llm-backend groq \
+  --llm-model llama-3.3-70b-versatile \
+  --output benchmarks/oolong/results_rlm.json
+```
+
 ## Notes
 
-- `--llm-command` must print only the final answer to stdout.
+- `--llm-command` must print only the final answer to stdout for `waggle_llm`, or the next JSON action / final answer for `waggle_rlm`.
+- `--llm-backend groq` reads the API key from `GROQ_API_KEY` by default; override with `--llm-api-key-env`.
 - The command template receives `{prompt_file}` and `{prompt}` placeholders.
 - Retrieval defaults to `graph` mode with chunk-to-chunk edges so Waggle can expand around a strong seed chunk.
+- `waggle_rlm` also supports `--rlm-system-prompt-file` if you want to replace the default Waggle-oriented RLM system prompt.
 - This runner is intentionally local-first. It does not download OOLONG automatically; provide a local export path.

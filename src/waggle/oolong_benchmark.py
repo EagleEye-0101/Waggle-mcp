@@ -4,6 +4,8 @@ import argparse
 import ast
 import json
 import math
+import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -15,6 +17,16 @@ from waggle.benchmark_harness import BenchmarkRuntimeError
 from waggle.embeddings import EmbeddingModel
 from waggle.graph import MemoryGraph
 from waggle.models import NodeType, SubgraphResult
+from waggle.rlm import (
+    DEFAULT_WAGGLE_RLM_SYSTEM_PROMPT,
+    _infer_semantic_label,
+    build_gemini_backend_kwargs,
+    build_groq_openai_backend_kwargs,
+    build_subprocess_response_fn,
+    run_gemini_one_shot,
+    run_groq_one_shot,
+    run_waggle_rlm,
+)
 
 
 DEFAULT_PROJECT = "oolong-benchmark"
@@ -129,6 +141,103 @@ def answers_match(prediction: str, gold: str) -> bool:
     return _normalize_for_match(prediction) == _normalize_for_match(gold)
 
 
+_PAIR_ANSWER_PATTERN = re.compile(r"\((\d+)\s*,\s*(\d+)\)")
+_RECORD_BLOCK_PATTERN = re.compile(
+    r"Example\s+(?P<example_id>\d+):\s*"
+    r"Text:\s*(?P<text>.*?)\s*"
+    r"User:\s*(?P<user>[^\n]+)\s*"
+    r"Date:\s*(?P<date>[^\n]+)",
+    re.DOTALL,
+)
+
+
+def _parse_pair_answer_users(value: Any) -> set[str]:
+    parsed = _maybe_parse_answer_literal(value)
+    users: set[str] = set()
+
+    def _collect(text: str) -> None:
+        for left, right in _PAIR_ANSWER_PATTERN.findall(text):
+            users.add(left)
+            users.add(right)
+
+    if isinstance(parsed, list):
+        for item in parsed:
+            _collect(str(item))
+        return users
+    if isinstance(parsed, str):
+        _collect(parsed)
+    return users
+
+
+def _parse_structured_context_records(context_text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for match in _RECORD_BLOCK_PATTERN.finditer(context_text):
+        records.append(
+            {
+                "example_id": match.group("example_id").strip(),
+                "text": match.group("text").strip(),
+                "user": match.group("user").strip(),
+                "date": match.group("date").strip(),
+            }
+        )
+    return records
+
+
+def _validate_pair_answer_reachability(example: OolongExample) -> None:
+    task_group = str(example.metadata.get("task_group", "")).strip().lower()
+    answer_type = str(example.metadata.get("answer_type", "")).strip().lower()
+    if task_group != "oolong-pairs" or answer_type != "list":
+        return
+
+    gold_users = _parse_pair_answer_users(example.raw_answer)
+    if not gold_users:
+        return
+
+    visible_qualifying_users = {
+        record["user"]
+        for record in _parse_structured_context_records(example.context_text)
+        if _infer_semantic_label(record["text"]) in {"numeric value", "location"}
+    }
+    missing_users = sorted(gold_users - visible_qualifying_users, key=int)
+    if not missing_users:
+        return
+
+    raise BenchmarkRuntimeError(
+        "Unreachable OOLONG gold answer: "
+        f"example '{example.example_id}' requires users {', '.join(missing_users)} in the gold pair set, "
+        "but those users have no visible numeric-value or location record in the provided context."
+    )
+
+
+def _validate_retrieved_user_scope(example: OolongExample, retrieved_text: str) -> None:
+    task_group = str(example.metadata.get("task_group", "")).strip().lower()
+    answer_type = str(example.metadata.get("answer_type", "")).strip().lower()
+    if task_group != "oolong-pairs" or answer_type != "list":
+        return
+
+    visible_users = {
+        record["user"]
+        for record in _parse_structured_context_records(example.context_text)
+        if record.get("user", "").strip()
+    }
+    if not visible_users:
+        return
+
+    retrieved_users = {
+        record["user"]
+        for record in _parse_structured_context_records(retrieved_text)
+        if record.get("user", "").strip()
+    }
+    leaked_users = sorted(retrieved_users - visible_users, key=int)
+    if not leaked_users:
+        return
+
+    raise BenchmarkRuntimeError(
+        "Cross-row retrieval contamination: "
+        f"example '{example.example_id}' retrieved users {', '.join(leaked_users)} that do not appear in its context_window_text."
+    )
+
+
 def _read_dataset_records(dataset_path: str | Path) -> list[dict[str, Any]]:
     path = Path(dataset_path)
     text = path.read_text(encoding="utf-8")
@@ -218,6 +327,7 @@ def load_oolong_examples(
                 metadata=metadata,
             )
         )
+        _validate_pair_answer_reachability(examples[-1])
         if limit is not None and len(examples) >= limit:
             break
     return examples
@@ -347,13 +457,20 @@ def evaluate_oolong(
     limit: int | None = None,
     llm_answerer: Callable[[str], str] | None = None,
     project: str = DEFAULT_PROJECT,
+    rlm_system_prompt: str = DEFAULT_WAGGLE_RLM_SYSTEM_PROMPT,
+    rlm_max_iterations: int = 6,
+    rlm_backend: str = "openai",
+    rlm_backend_kwargs: dict[str, Any] | None = None,
+    rlm_mock_response_fn: Callable[[str | dict[str, Any]], str] | None = None,
 ) -> OolongReport:
-    if eval_mode not in {"retrieval_only", "waggle_llm"}:
-        raise BenchmarkRuntimeError("eval_mode must be one of: retrieval_only, waggle_llm.")
+    if eval_mode not in {"retrieval_only", "waggle_llm", "waggle_rlm"}:
+        raise BenchmarkRuntimeError("eval_mode must be one of: retrieval_only, waggle_llm, waggle_rlm.")
     if retrieval_mode not in {"graph", "fusion", "replay", "aggregate"}:
         raise BenchmarkRuntimeError("retrieval_mode must be one of: graph, fusion, replay, aggregate.")
     if eval_mode == "waggle_llm" and llm_answerer is None:
         raise BenchmarkRuntimeError("waggle_llm mode requires an llm_answerer.")
+    if eval_mode == "waggle_rlm" and rlm_backend_kwargs is None and rlm_mock_response_fn is None:
+        raise BenchmarkRuntimeError("waggle_rlm mode requires backend kwargs or an rlm mock response function.")
 
     examples = load_oolong_examples(
         dataset_path,
@@ -402,11 +519,45 @@ def evaluate_oolong(
             prompt = build_oolong_prompt(example, result)
             prediction = ""
             correct = False
-            if llm_answerer is not None:
+            retrieved_node_ids = [node.id for node in result.nodes]
+            retrieved_node_labels = [node.label for node in result.nodes]
+            bundle_text = _bundle_text(result)
+            _validate_retrieved_user_scope(example, bundle_text)
+            retrieved_tokens = _estimate_tokens(bundle_text)
+            prompt_tokens = _estimate_tokens(prompt)
+            if eval_mode == "waggle_llm" and llm_answerer is not None:
                 prediction = llm_answerer(prompt).strip()
                 correct = answers_match(prediction, example.answer)
+            if eval_mode == "waggle_rlm":
+                rlm_result = run_waggle_rlm(
+                    graph,
+                    question=example.question,
+                    context=example.context_text,
+                    project=project,
+                    session_id=example.context_window_id,
+                    retrieval_mode=retrieval_mode,
+                    max_nodes=max_nodes,
+                    max_depth=max_depth,
+                    system_prompt=rlm_system_prompt,
+                    max_iterations=rlm_max_iterations,
+                    backend=rlm_backend,
+                    backend_kwargs=rlm_backend_kwargs,
+                    mock_response_fn=rlm_mock_response_fn,
+                )
+                prediction = rlm_result.answer.strip()
+                correct = answers_match(prediction, example.answer)
+                metadata = dict(example.metadata)
+                metadata.update(rlm_result.to_metadata())
+                visited_nodes = [graph.get_node(node_id) for node_id in rlm_result.visited_node_ids]
+                retrieved_node_ids = [node.id for node in visited_nodes]
+                retrieved_node_labels = [node.label for node in visited_nodes]
+                bundle_text = "\n\n".join(node.content for node in visited_nodes).strip()
+                _validate_retrieved_user_scope(example, bundle_text)
+                retrieved_tokens = _estimate_tokens(bundle_text)
+                prompt_tokens = _estimate_tokens(example.question)
+            else:
+                metadata = dict(example.metadata)
 
-            bundle_text = _bundle_text(result)
             per_case.append(
                 OolongCaseResult(
                     example_id=example.example_id,
@@ -416,12 +567,12 @@ def evaluate_oolong(
                     gold_answer=example.answer,
                     predicted_answer=prediction,
                     correct=correct,
-                    retrieved_node_ids=[node.id for node in result.nodes],
-                    retrieved_node_labels=[node.label for node in result.nodes],
-                    retrieved_node_count=len(result.nodes),
-                    retrieved_tokens=_estimate_tokens(bundle_text),
-                    prompt_tokens=_estimate_tokens(prompt),
-                    metadata=dict(example.metadata),
+                    retrieved_node_ids=retrieved_node_ids,
+                    retrieved_node_labels=retrieved_node_labels,
+                    retrieved_node_count=len(retrieved_node_ids),
+                    retrieved_tokens=retrieved_tokens,
+                    prompt_tokens=prompt_tokens,
+                    metadata=metadata,
                 )
             )
 
@@ -450,14 +601,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("dataset_path", help="Path to a local OOLONG JSON or JSONL export.")
     parser.add_argument("--dataset-kind", choices=["auto", "real", "synth", "custom"], default="auto")
     parser.add_argument("--context-field", default="auto")
-    parser.add_argument("--eval-mode", choices=["retrieval_only", "waggle_llm"], default="retrieval_only")
+    parser.add_argument("--eval-mode", choices=["retrieval_only", "waggle_llm", "waggle_rlm"], default="retrieval_only")
     parser.add_argument("--llm-command", default="", help="Command template that reads {prompt_file} and prints an answer.")
+    parser.add_argument("--llm-backend", choices=["command", "groq", "gemini"], default="command")
+    parser.add_argument("--llm-model", default="llama-3.3-70b-versatile")
+    parser.add_argument("--llm-api-key-env", default="GROQ_API_KEY")
+    parser.add_argument("--llm-max-tokens", type=int, default=512)
+    parser.add_argument("--llm-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--embedding-model", default="all-MiniLM-L6-v2")
     parser.add_argument("--retrieval-mode", choices=["graph", "fusion", "replay", "aggregate"], default="graph")
     parser.add_argument("--max-nodes", type=int, default=8)
     parser.add_argument("--max-depth", type=int, default=1)
     parser.add_argument("--chunk-lines", type=int, default=12)
     parser.add_argument("--chunk-overlap-lines", type=int, default=3)
+    parser.add_argument("--rlm-system-prompt-file", default="")
+    parser.add_argument("--rlm-max-iterations", type=int, default=6)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default="", help="Optional JSON report path.")
     return parser
@@ -468,8 +626,42 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     llm_answerer: Callable[[str], str] | None = None
-    if args.llm_command:
-        llm_answerer = lambda prompt: run_subprocess_llm(prompt, command_template=args.llm_command)
+    rlm_backend = "openai"
+    rlm_backend_kwargs: dict[str, Any] | None = None
+    rlm_mock_response_fn: Callable[[str | dict[str, Any]], str] | None = None
+
+    if args.llm_backend == "command":
+        if args.llm_command:
+            llm_answerer = lambda prompt: run_subprocess_llm(prompt, command_template=args.llm_command)
+            rlm_mock_response_fn = build_subprocess_response_fn(args.llm_command)
+    elif args.llm_backend == "groq":
+        api_key = os.environ.get(args.llm_api_key_env, "").strip()
+        if not api_key:
+            raise BenchmarkRuntimeError(f"{args.llm_api_key_env} is required for --llm-backend groq.")
+        rlm_backend_kwargs = build_groq_openai_backend_kwargs(api_key=api_key, model_name=args.llm_model)
+        llm_answerer = lambda prompt: run_groq_one_shot(
+            prompt=prompt,
+            api_key=api_key,
+            model_name=args.llm_model,
+            max_tokens=args.llm_max_tokens,
+            timeout_seconds=args.llm_timeout_seconds,
+        )
+    elif args.llm_backend == "gemini":
+        api_key = os.environ.get(args.llm_api_key_env, "").strip()
+        if not api_key:
+            raise BenchmarkRuntimeError(f"{args.llm_api_key_env} is required for --llm-backend gemini.")
+        rlm_backend = "gemini"
+        rlm_backend_kwargs = build_gemini_backend_kwargs(api_key=api_key, model_name=args.llm_model)
+        llm_answerer = lambda prompt: run_gemini_one_shot(
+            prompt=prompt,
+            api_key=api_key,
+            model_name=args.llm_model,
+            timeout_seconds=args.llm_timeout_seconds,
+        )
+
+    rlm_system_prompt = DEFAULT_WAGGLE_RLM_SYSTEM_PROMPT
+    if args.rlm_system_prompt_file:
+        rlm_system_prompt = Path(args.rlm_system_prompt_file).read_text(encoding="utf-8")
 
     report = evaluate_oolong(
         args.dataset_path,
@@ -484,6 +676,11 @@ def main(argv: list[str] | None = None) -> int:
         chunk_overlap_lines=args.chunk_overlap_lines,
         limit=args.limit,
         llm_answerer=llm_answerer,
+        rlm_system_prompt=rlm_system_prompt,
+        rlm_max_iterations=args.rlm_max_iterations,
+        rlm_backend=rlm_backend,
+        rlm_backend_kwargs=rlm_backend_kwargs,
+        rlm_mock_response_fn=rlm_mock_response_fn,
     )
 
     payload = report.to_dict()

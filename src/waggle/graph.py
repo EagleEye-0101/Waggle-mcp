@@ -532,8 +532,6 @@ def _scope_matches(node: Node, *, agent_id: str = "", project: str = "", session
 
 
 def _retrieval_session_scope(*, agent_id: str = "", project: str = "", session_id: str = "") -> str:
-    if session_id.strip() and (agent_id.strip() or project.strip()):
-        return ""
     return session_id
 
 
@@ -552,6 +550,7 @@ class MemoryGraph:
         tenant_id: str = "local-default",
         dedup_similarity_threshold: float = 0.97,
         dedup_same_label_threshold: float = 0.9,
+        enable_dedup: bool = True,
         recency_half_life_days: float = 30.0,
         tiered_retrieval: bool = False,
         tiered_retrieval_top_k_windows: int = 3,
@@ -562,6 +561,7 @@ class MemoryGraph:
         self.tenant_id = tenant_id.strip() or "local-default"
         self.dedup_similarity_threshold = dedup_similarity_threshold
         self.dedup_same_label_threshold = dedup_same_label_threshold
+        self.enable_dedup = enable_dedup
         self.recency_half_life_days = recency_half_life_days
         self.tiered_retrieval = tiered_retrieval
         self.tiered_retrieval_top_k_windows = max(1, tiered_retrieval_top_k_windows)
@@ -599,6 +599,7 @@ class MemoryGraph:
         clone.tenant_id = tenant_id.strip() or "local-default"
         clone.dedup_similarity_threshold = self.dedup_similarity_threshold
         clone.dedup_same_label_threshold = self.dedup_same_label_threshold
+        clone.enable_dedup = self.enable_dedup
         clone.recency_half_life_days = self.recency_half_life_days
         clone.tiered_retrieval = self.tiered_retrieval
         clone.tiered_retrieval_top_k_windows = self.tiered_retrieval_top_k_windows
@@ -1370,14 +1371,19 @@ class MemoryGraph:
         evidence_records: list[EvidenceRecord] | None = None,
         valid_from: datetime | None = None,
         valid_to: datetime | None = None,
+        context_window_id: str | None = None,
+        embedding: np.ndarray | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> NodeStoreResult:
-        _, context_window_id = self.resolve_window_context(project=project, session_id=session_id)
+        resolved_context_window_id = context_window_id
+        if resolved_context_window_id is None:
+            _, resolved_context_window_id = self.resolve_window_context(project=project, session_id=session_id)
         node = Node(
             tenant_id=self.tenant_id,
             agent_id=agent_id,
             project=project,
             session_id=session_id,
-            context_window_id=context_window_id,
+            context_window_id=resolved_context_window_id,
             label=label,
             content=content,
             node_type=node_type,
@@ -1388,35 +1394,36 @@ class MemoryGraph:
             valid_from=valid_from,
             valid_to=valid_to,
         )
-        embedding = self.embedding_model.embed(node.content)
+        embedding_vector = embedding if embedding is not None else self.embedding_model.embed(node.content)
 
-        with self._lock, self._connect() as connection:
-            duplicate = self._find_duplicate_node(connection, node=node, embedding=embedding)
-            if duplicate is not None:
-                existing_node, dedup_reason, similarity = duplicate
-                merged_node = self._merge_duplicate_node(
-                    connection,
-                    existing_node=existing_node,
-                    incoming_node=node,
-                )
-                if merged_node.context_window_id:
-                    connection.execute(
-                        """
-                        UPDATE nodes
-                        SET context_window_id = COALESCE(context_window_id, ?)
-                        WHERE tenant_id = ? AND id = ?
-                        """,
-                        (merged_node.context_window_id, self.tenant_id, merged_node.id),
+        def _insert(active_connection: sqlite3.Connection) -> NodeStoreResult:
+            if self.enable_dedup:
+                duplicate = self._find_duplicate_node(active_connection, node=node, embedding=embedding_vector)
+                if duplicate is not None:
+                    existing_node, dedup_reason, similarity = duplicate
+                    merged_node = self._merge_duplicate_node(
+                        active_connection,
+                        existing_node=existing_node,
+                        incoming_node=node,
                     )
-                    self._mark_window_embedding_stale(connection, merged_node.context_window_id)
-                return NodeStoreResult(
-                    node=merged_node,
-                    created=False,
-                    dedup_reason=dedup_reason,
-                    similarity=similarity,
-                )
+                    if merged_node.context_window_id:
+                        active_connection.execute(
+                            """
+                            UPDATE nodes
+                            SET context_window_id = COALESCE(context_window_id, ?)
+                            WHERE tenant_id = ? AND id = ?
+                            """,
+                            (merged_node.context_window_id, self.tenant_id, merged_node.id),
+                        )
+                        self._mark_window_embedding_stale(active_connection, merged_node.context_window_id)
+                    return NodeStoreResult(
+                        node=merged_node,
+                        created=False,
+                        dedup_reason=dedup_reason,
+                        similarity=similarity,
+                    )
 
-            connection.execute(
+            active_connection.execute(
                 """
                 INSERT INTO nodes (
                     id, tenant_id, agent_id, project, session_id, context_window_id,
@@ -1438,7 +1445,7 @@ class MemoryGraph:
                     node.node_type.value,
                     json.dumps(node.tags),
                     _encode_metadata(node.metadata),
-                    self.embedding_model.to_bytes(embedding),
+                    self.embedding_model.to_bytes(embedding_vector),
                     node.source_prompt,
                     _encode_evidence_records(node.evidence_records),
                     node.valid_from.isoformat() if node.valid_from is not None else None,
@@ -1448,10 +1455,15 @@ class MemoryGraph:
                     node.access_count,
                 ),
             )
-            self._mark_window_embedding_stale(connection, context_window_id)
-            self._update_window_node_count(connection, context_window_id)
-            conflicts = self._register_conflicts(connection, node)
-        return NodeStoreResult(node=node, created=True, conflicts=conflicts)
+            self._mark_window_embedding_stale(active_connection, resolved_context_window_id)
+            self._update_window_node_count(active_connection, resolved_context_window_id)
+            conflicts = self._register_conflicts(active_connection, node) if self.enable_dedup else []
+            return NodeStoreResult(node=node, created=True, conflicts=conflicts)
+
+        if connection is not None:
+            return _insert(connection)
+        with self._lock, self._connect() as managed_connection:
+            return _insert(managed_connection)
 
     def add_edge(
         self,
@@ -1461,6 +1473,7 @@ class MemoryGraph:
         relationship: str | RelationType,
         weight: float = 1.0,
         metadata: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
         ) -> Edge:
         edge = Edge(
             tenant_id=self.tenant_id,
@@ -1471,20 +1484,24 @@ class MemoryGraph:
             metadata=metadata or {},
         )
 
-        with self._lock, self._connect() as connection:
-            self._require_node(connection, edge.source_id)
-            self._require_node(connection, edge.target_id)
-            source_node = self.get_node(edge.source_id)
-            target_node = self.get_node(edge.target_id)
+        def _insert(active_connection: sqlite3.Connection) -> Edge:
+            self._require_node(active_connection, edge.source_id)
+            self._require_node(active_connection, edge.target_id)
+            source_row = self._fetch_node_row(active_connection, edge.source_id)
+            target_row = self._fetch_node_row(active_connection, edge.target_id)
+            if source_row is None or target_row is None:
+                raise ValueError("Edge endpoint missing during insert.")
+            source_node = self._row_to_node(source_row)
+            target_node = self._row_to_node(target_row)
             existing_edge = self._find_existing_edge(
-                connection,
+                active_connection,
                 source_id=edge.source_id,
                 target_id=edge.target_id,
                 relationship=edge.relationship,
             )
             if existing_edge is not None:
                 return existing_edge
-            connection.execute(
+            active_connection.execute(
                 """
                 INSERT INTO edges (
                     id, tenant_id, source_id, target_id, relationship, weight, metadata, created_at
@@ -1503,8 +1520,13 @@ class MemoryGraph:
                 ),
             )
             if edge.relationship in {RelationType.UPDATES.value, RelationType.CONTRADICTS.value}:
-                self._mark_node_superseded(connection, old_node=target_node, new_node=source_node, relationship=edge.relationship)
-        return edge
+                self._mark_node_superseded(active_connection, old_node=target_node, new_node=source_node, relationship=edge.relationship)
+            return edge
+
+        if connection is not None:
+            return _insert(connection)
+        with self._lock, self._connect() as managed_connection:
+            return _insert(managed_connection)
 
     def get_node(self, node_id: str) -> Node:
         with self._lock, self._connect() as connection:
@@ -2146,15 +2168,31 @@ class MemoryGraph:
     ) -> SubgraphResult:
         with self._lock, self._connect() as connection:
             temporal_hints = infer_temporal_hints(query)
+            active_session_id = _retrieval_session_scope(
+                agent_id=agent_id,
+                project=project,
+                session_id=session_id,
+            )
+            filters = ["tenant_id = ?", "embedding IS NOT NULL"]
+            params: list[Any] = [self.tenant_id]
+            if project.strip():
+                filters.append("project = ?")
+                params.append(project.strip())
+            if active_session_id.strip():
+                filters.append("session_id = ?")
+                params.append(active_session_id.strip())
+            elif agent_id.strip():
+                filters.append("agent_id = ?")
+                params.append(agent_id.strip())
             node_rows = connection.execute(
-                """
+                f"""
                 SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags,
                        source_prompt, metadata, evidence_records, valid_from, valid_to, created_at,
                        updated_at, access_count, embedding, tenant_id
                 FROM nodes
-                WHERE tenant_id = ? AND embedding IS NOT NULL
+                WHERE {" AND ".join(filters)}
                 """,
-                (self.tenant_id,),
+                tuple(params),
             ).fetchall()
             total_nodes = len(node_rows)
             if total_nodes == 0:
@@ -2171,11 +2209,6 @@ class MemoryGraph:
                     scoped_embeddings[node.id] = self.embedding_model.from_bytes(row["embedding"])
                 return scoped_nodes, scoped_embeddings
 
-            active_session_id = _retrieval_session_scope(
-                agent_id=agent_id,
-                project=project,
-                session_id=session_id,
-            )
             nodes_by_id, embeddings_by_id = collect_scoped_nodes(active_session_id)
 
             if not nodes_by_id:
@@ -4521,14 +4554,26 @@ class MemoryGraph:
         node: Node,
         embedding: np.ndarray,
     ) -> tuple[Node, str, float | None] | None:
+        filters = ["tenant_id = ?", "embedding IS NOT NULL"]
+        params: list[Any] = [self.tenant_id]
+        if node.project:
+            filters.append("project = ?")
+            params.append(node.project)
+        if node.session_id:
+            filters.append("session_id = ?")
+            params.append(node.session_id)
+        elif node.agent_id:
+            filters.append("agent_id = ?")
+            params.append(node.agent_id)
+
         rows = connection.execute(
-            """
+            f"""
             SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata, evidence_records,
                    valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
-            WHERE tenant_id = ? AND embedding IS NOT NULL
+            WHERE {" AND ".join(filters)}
             """,
-            (self.tenant_id,),
+            tuple(params),
         ).fetchall()
 
         normalized_label = normalize_text(node.label)
@@ -4730,14 +4775,26 @@ class MemoryGraph:
         if node.node_type not in {NodeType.PREFERENCE, NodeType.DECISION}:
             return []
 
+        filters = ["tenant_id = ?", "id != ?"]
+        params: list[Any] = [self.tenant_id, node.id]
+        if node.project:
+            filters.append("project = ?")
+            params.append(node.project)
+        if node.session_id:
+            filters.append("session_id = ?")
+            params.append(node.session_id)
+        elif node.agent_id:
+            filters.append("agent_id = ?")
+            params.append(node.agent_id)
+
         rows = connection.execute(
-            """
+            f"""
             SELECT id, agent_id, project, session_id, context_window_id, label, content, node_type, tags, source_prompt, metadata,
                    evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
-            WHERE tenant_id = ? AND id != ?
+            WHERE {" AND ".join(filters)}
             """,
-            (self.tenant_id, node.id),
+            tuple(params),
         ).fetchall()
         conflicts: list[ConflictRecord] = []
         for row in rows:

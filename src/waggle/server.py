@@ -44,7 +44,15 @@ from waggle.graph import MemoryGraph
 from waggle.graph_ui import render_graph_editor_html
 from waggle.logging_utils import configure_logging
 from waggle.metrics import MetricsRegistry
-from waggle.oolong_benchmark import evaluate_oolong, run_subprocess_llm
+from waggle.oolong_benchmark import evaluate_oolong
+from waggle.rlm import (
+    DEFAULT_WAGGLE_RLM_SYSTEM_PROMPT,
+    build_gemini_backend_kwargs,
+    build_groq_openai_backend_kwargs,
+    build_subprocess_response_fn,
+    run_gemini_one_shot,
+    run_groq_one_shot,
+)
 from waggle.models import (
     ConflictEntry,
     ConflictListResult,
@@ -2773,13 +2781,20 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark_oolong.add_argument("dataset_path")
     benchmark_oolong.add_argument("--dataset-kind", choices=["auto", "real", "synth", "custom"], default="auto")
     benchmark_oolong.add_argument("--context-field", default="auto")
-    benchmark_oolong.add_argument("--eval-mode", choices=["retrieval_only", "waggle_llm"], default="retrieval_only")
+    benchmark_oolong.add_argument("--eval-mode", choices=["retrieval_only", "waggle_llm", "waggle_rlm"], default="retrieval_only")
     benchmark_oolong.add_argument("--llm-command", default="")
-    benchmark_oolong.add_argument("--retrieval-mode", choices=["graph", "fusion", "replay"], default="graph")
+    benchmark_oolong.add_argument("--llm-backend", choices=["command", "groq", "gemini"], default="command")
+    benchmark_oolong.add_argument("--llm-model", default="llama-3.3-70b-versatile")
+    benchmark_oolong.add_argument("--llm-api-key-env", default="GROQ_API_KEY")
+    benchmark_oolong.add_argument("--llm-max-tokens", type=int, default=512)
+    benchmark_oolong.add_argument("--llm-timeout-seconds", type=float, default=60.0)
+    benchmark_oolong.add_argument("--retrieval-mode", choices=["graph", "fusion", "replay", "aggregate"], default="graph")
     benchmark_oolong.add_argument("--max-nodes", type=int, default=8)
     benchmark_oolong.add_argument("--max-depth", type=int, default=1)
     benchmark_oolong.add_argument("--chunk-lines", type=int, default=12)
     benchmark_oolong.add_argument("--chunk-overlap-lines", type=int, default=3)
+    benchmark_oolong.add_argument("--rlm-system-prompt-file", default="")
+    benchmark_oolong.add_argument("--rlm-max-iterations", type=int, default=6)
     benchmark_oolong.add_argument("--limit", type=int, default=None)
     benchmark_oolong.add_argument("--output", default="")
 
@@ -3031,8 +3046,44 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         return 0
     if args.command == "benchmark-oolong":
         llm_answerer = None
-        if args.llm_command:
-            llm_answerer = lambda prompt: run_subprocess_llm(prompt, command_template=args.llm_command)
+        rlm_backend = "openai"
+        rlm_backend_kwargs: dict[str, Any] | None = None
+        rlm_mock_response_fn = None
+        if args.llm_backend == "command":
+            if args.llm_command:
+                from waggle.oolong_benchmark import run_subprocess_llm
+
+                llm_answerer = lambda prompt: run_subprocess_llm(prompt, command_template=args.llm_command)
+                rlm_mock_response_fn = build_subprocess_response_fn(args.llm_command)
+        elif args.llm_backend == "groq":
+            api_key = os.environ.get(args.llm_api_key_env, "").strip()
+            if not api_key:
+                raise ValidationFailure(f"{args.llm_api_key_env} is required for --llm-backend groq.")
+            rlm_backend_kwargs = build_groq_openai_backend_kwargs(api_key=api_key, model_name=args.llm_model)
+            llm_answerer = lambda prompt: run_groq_one_shot(
+                prompt=prompt,
+                api_key=api_key,
+                model_name=args.llm_model,
+                max_tokens=args.llm_max_tokens,
+                timeout_seconds=args.llm_timeout_seconds,
+            )
+        elif args.llm_backend == "gemini":
+            api_key = os.environ.get(args.llm_api_key_env, "").strip()
+            if not api_key:
+                raise ValidationFailure(f"{args.llm_api_key_env} is required for --llm-backend gemini.")
+            rlm_backend = "gemini"
+            rlm_backend_kwargs = build_gemini_backend_kwargs(api_key=api_key, model_name=args.llm_model)
+            llm_answerer = lambda prompt: run_gemini_one_shot(
+                prompt=prompt,
+                api_key=api_key,
+                model_name=args.llm_model,
+                timeout_seconds=args.llm_timeout_seconds,
+            )
+
+        rlm_system_prompt = DEFAULT_WAGGLE_RLM_SYSTEM_PROMPT
+        if args.rlm_system_prompt_file:
+            rlm_system_prompt = Path(args.rlm_system_prompt_file).read_text(encoding="utf-8")
+
         report = evaluate_oolong(
             args.dataset_path,
             dataset_kind=args.dataset_kind,
@@ -3046,6 +3097,11 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
             chunk_overlap_lines=args.chunk_overlap_lines,
             limit=args.limit,
             llm_answerer=llm_answerer,
+            rlm_system_prompt=rlm_system_prompt,
+            rlm_max_iterations=args.rlm_max_iterations,
+            rlm_backend=rlm_backend,
+            rlm_backend_kwargs=rlm_backend_kwargs,
+            rlm_mock_response_fn=rlm_mock_response_fn,
         )
         payload = report.to_dict()
         if args.output:

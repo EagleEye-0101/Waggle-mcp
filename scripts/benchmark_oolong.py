@@ -4,6 +4,7 @@ OOLONG benchmark entrypoint for Waggle.
 Examples:
     PYTHONPATH=src .venv/bin/python scripts/benchmark_oolong.py /path/to/oolong.jsonl --eval-mode retrieval_only
     PYTHONPATH=src .venv/bin/python scripts/benchmark_oolong.py /path/to/oolong.jsonl --eval-mode waggle_llm --llm-command "python my_llm_runner.py {prompt_file}"
+    PYTHONPATH=src GROQ_API_KEY=gsk_... .venv/bin/python scripts/benchmark_oolong.py /path/to/oolong.jsonl --eval-mode waggle_rlm --llm-backend groq
 """
 from __future__ import annotations
 

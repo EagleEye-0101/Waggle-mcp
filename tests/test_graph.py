@@ -1369,11 +1369,35 @@ def test_query_can_filter_by_explicit_scopes(tmp_path: Path) -> None:
 
     assert [node.label for node in alpha.nodes] == ["DB choice alpha"]
     assert [node.label for node in beta.nodes] == ["DB choice beta"]
-    assert [node.label for node in new_session.nodes] == ["DB choice alpha"]
+    assert new_session.nodes == []
     assert missing_session_only.nodes == []
     assert scopes.agent_ids == ["claude", "codex"]
     assert scopes.projects == ["alpha", "beta"]
     assert scopes.session_ids == ["sess-alpha", "sess-beta"]
+
+
+def test_query_intersects_project_and_session_scope(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="Alpha session one",
+        content="Alpha project first session note.",
+        node_type=NodeType.NOTE,
+        project="alpha",
+        session_id="sess-1",
+    )
+    graph.add_node(
+        label="Alpha session two",
+        content="Alpha project second session note.",
+        node_type=NodeType.NOTE,
+        project="alpha",
+        session_id="sess-2",
+    )
+
+    sess_one = graph.query(query="alpha session note", project="alpha", session_id="sess-1", max_nodes=5, max_depth=0)
+    sess_two = graph.query(query="alpha session note", project="alpha", session_id="sess-2", max_nodes=5, max_depth=0)
+
+    assert [node.label for node in sess_one.nodes] == ["Alpha session one"]
+    assert [node.label for node in sess_two.nodes] == ["Alpha session two"]
 
 
 def test_observe_conversation_extracts_clean_database_and_auth_facts(tmp_path: Path) -> None:
@@ -1738,9 +1762,8 @@ def test_graph_diff_and_prime_context(tmp_path: Path) -> None:
 
     assert diff.added_nodes
     assert prime.nodes
-    assert new_session_prime.nodes
+    assert new_session_prime.nodes == []
     assert any("alpha" in node.tags for node in prime.nodes)
-    assert any("alpha" in node.tags for node in new_session_prime.nodes)
 
 
 def test_get_topics_returns_clusters(tmp_path: Path) -> None:
