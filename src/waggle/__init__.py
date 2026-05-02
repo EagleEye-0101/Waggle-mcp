@@ -60,5 +60,4 @@ def __getattr__(name: str):
 try:  # pragma: no cover
     __version__ = version("waggle-mcp")
 except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.1.11"
-
+    __version__ = "0.1.13"
