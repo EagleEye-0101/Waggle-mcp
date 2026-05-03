@@ -47,6 +47,11 @@ class AppConfig:
     hybrid_rerank_top_k_in: int = 20
     hybrid_rerank_top_k_out: int = 5
     startup_mode: str = STARTUP_MODE_NORMAL  # fast | normal | strict
+    # Canonicalization-at-write dedup threshold.
+    # Nodes with cosine similarity >= this value (and matching node_type + scope)
+    # are merged at write time instead of creating a duplicate.
+    # Must be >= 0.85 to avoid false-positive merges.
+    dedup_threshold: float = 0.88
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -84,6 +89,7 @@ class AppConfig:
             startup_mode=os.environ.get("WAGGLE_STARTUP_MODE", STARTUP_MODE_NORMAL).strip().lower(),
             tiered_retrieval=os.environ.get("WAGGLE_TIERED_RETRIEVAL", "false").strip().lower() == "true",
             tiered_retrieval_top_k_windows=int(os.environ.get("WAGGLE_TIERED_TOP_K_WINDOWS", "3")),
+            dedup_threshold=float(os.environ.get("WAGGLE_DEDUP_THRESHOLD", "0.88")),
         )
         config.validate()
         return config
@@ -107,6 +113,10 @@ class AppConfig:
             raise ValidationFailure(
                 f"Unsupported WAGGLE_STARTUP_MODE: {self.startup_mode!r}. "
                 f"Valid values: fast, normal, strict."
+            )
+        if self.dedup_threshold < 0.85:
+            raise ValidationFailure(
+                "WAGGLE_DEDUP_THRESHOLD must be >= 0.85 to avoid false-positive merges."
             )
         if self.recency_half_life_days <= 0:
             raise ValidationFailure("WAGGLE_RECENCY_HALF_LIFE_DAYS must be greater than 0.")

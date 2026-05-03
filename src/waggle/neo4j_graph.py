@@ -983,7 +983,7 @@ class Neo4jMemoryGraph:
         agent_id: str = "",
         project: str = "",
         session_id: str = "",
-        retrieval_mode: str = "graph",
+        retrieval_mode: str = "hybrid",
     ) -> SubgraphResult:
         query_text = query.strip()
         if not query_text:
@@ -993,8 +993,11 @@ class Neo4jMemoryGraph:
         if max_depth < 0:
             raise ValueError("max_depth cannot be negative.")
         normalized_mode = {"replay": "verbatim", "fusion": "hybrid"}.get(retrieval_mode.strip().lower(), retrieval_mode.strip().lower())
+        # Accept "hybrid_no_rerank" as alias for "hybrid" (reranking is configurable via HybridRetrievalConfig)
+        if normalized_mode == "hybrid_no_rerank":
+            normalized_mode = "hybrid"
         if normalized_mode not in {"graph", "verbatim", "hybrid"}:
-            raise ValidationFailure("retrieval_mode must be one of: graph, verbatim, hybrid.")
+            raise ValidationFailure("retrieval_mode must be one of: graph, verbatim, hybrid, hybrid_no_rerank (benchmark modes: graph_only, verbatim_only).")
 
         graph_result = (
             self._query_graph_only(

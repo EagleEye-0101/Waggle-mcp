@@ -21,6 +21,7 @@ EMBEDDING_FREE_TOOLS: frozenset[str] = frozenset(
         "list_conflicts",
         "get_node_history",
         "timeline",
+        "edge_quality_report",
     }
 )
 
