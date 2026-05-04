@@ -205,6 +205,16 @@ def _make_graph(db_path: str) -> MemoryGraph:
     return MemoryGraph(db_path, _DeterministicEmbedding())
 
 
+def _make_real_graph(db_path: str) -> MemoryGraph:
+    """Use Waggle's real sentence-transformers embedding model (all-MiniLM-L6-v2)."""
+    from waggle.embeddings import EmbeddingModel
+    emb = EmbeddingModel("all-MiniLM-L6-v2")
+    emb.start_background_warmup()
+    # Block until ready (up to 120s for first download)
+    emb._ready_event.wait(timeout=120)
+    return MemoryGraph(db_path, emb)
+
+
 # ---------------------------------------------------------------------------
 # Method runners
 # ---------------------------------------------------------------------------

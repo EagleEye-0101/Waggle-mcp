@@ -355,13 +355,24 @@ Disabling graph expansion (`rmca_no_graph_expansion`) or explicit conflict resol
 See `benchmark_results/pairwise_hidden_edge_ablation.md` and
 `docs/research/tables/hidden_edge_ablation.md` for the full analysis.
 
-### Claim Status After Hidden-Edge Ablation
+### Claim Status After Hidden-Edge Ablation (Deterministic + Real Embeddings)
+
+Both the deterministic hash-based model and Waggle's production `all-MiniLM-L6-v2` model
+were tested. **Results are identical across both models.**
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Decomposition is load-bearing | ✅ Confirmed | Score 1.0→0.0 at both scales, all 3 seeds |
-| Graph expansion is load-bearing | ❌ Not isolated | No delta; deterministic embedding limitation |
-| Conflict resolution is load-bearing | ❌ Not isolated | No delta; scorer limitation |
+| Decomposition is load-bearing | ✅ Confirmed | Score 1.0→0.0 at both scales, all 3 seeds, both embedding models |
+| Graph expansion is load-bearing | ❌ Not isolated | No delta with either model; root cause is benchmark construction |
+| Conflict resolution is load-bearing | ❌ Not isolated | No delta with either model; scorer limitation |
+
+**Why the real embedding model does not change the result:** The `pairwise_hidden_edge`
+node labels ("Cloud database", "Local deployment required") are semantically distinctive
+enough that `all-MiniLM-L6-v2` retrieves the gold conflict nodes directly via cosine
+similarity, without needing edge traversal. The benchmark needs nodes with semantically
+indistinguishable labels to isolate graph expansion.
+
+See `benchmark_results/pairwise_hidden_edge_ablation_real_emb.md` for the full analysis.
 
 
 ---
@@ -656,15 +667,15 @@ benefits. See `pairwise_hidden_edge` benchmark family for this purpose.
 
 ## Not Yet Supported
 
-1. **Graph expansion is load-bearing.** `pairwise_hidden_edge` ablation shows no delta
-   when graph expansion is disabled. Root cause: deterministic embedding model retrieves
-   conflict nodes by label similarity without needing edge traversal. Requires a real
-   embedding model and semantically similar node labels to isolate.
+1. **Graph expansion is load-bearing.** `pairwise_hidden_edge` ablation with both
+   deterministic and real (`all-MiniLM-L6-v2`) embeddings shows no delta when graph
+   expansion is disabled. Root cause is benchmark construction: node labels are
+   semantically distinctive enough that the real model retrieves conflict nodes without
+   edge traversal. Requires a benchmark with semantically indistinguishable node labels.
 
-2. **Conflict resolution is load-bearing.** Same root cause as above. Additionally,
-   the current scorer checks label presence, not explicit conflict annotation. A scorer
-   requiring "Possible conflict: X contradicts Y" in the context pack would likely
-   show a delta.
+2. **Conflict resolution is load-bearing.** Same root cause. Additionally, the scorer
+   checks label presence, not explicit conflict annotation. A scorer requiring
+   "Possible conflict: X contradicts Y" in the context pack would likely show a delta.
 
 3. **Results generalize to real-world agent traces.** Synthetic data only.
 

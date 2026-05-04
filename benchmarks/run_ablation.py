@@ -48,6 +48,7 @@ from waggle.recursive_context import AblationConfig, RecursiveContextController
 from rlm_style_waggle_eval import (
     BenchResult,
     _make_graph,
+    _make_real_graph,
     _BENCHMARK_RUNNERS,
     token_estimate,
     write_results,
@@ -185,6 +186,7 @@ def run_ablation(
     seed: int,
     output_dir: str,
     verbose: bool = False,
+    use_real_embeddings: bool = False,
 ) -> list[BenchResult]:
     """
     Run ablation study for all (variant, family, scale) combinations.
@@ -213,7 +215,7 @@ def run_ablation(
                     print(f"\n[ablation] variant={variant_name} family={family} scale={scale}")
 
                 try:
-                    graph = _make_graph(db_path)
+                    graph = _make_real_graph(db_path) if use_real_embeddings else _make_graph(db_path)
 
                     # Generate cases using the appropriate generator
                     if family == "pairwise":
@@ -378,6 +380,7 @@ def run_ablation_multi_seed(
     seeds: list[int],
     output_dir: str,
     verbose: bool = False,
+    use_real_embeddings: bool = False,
 ) -> list[BenchResult]:
     """
     Run ablation for multiple seeds and return per-seed rows plus aggregated
@@ -398,6 +401,7 @@ def run_ablation_multi_seed(
             seed=seed,
             output_dir=output_dir,
             verbose=verbose,
+            use_real_embeddings=use_real_embeddings,
         )
         per_seed_results.extend(seed_results)
 
@@ -441,7 +445,7 @@ def run_ablation_multi_seed(
 # ---------------------------------------------------------------------------
 
 
-def write_ablation_results(results: list[BenchResult], output_dir: str) -> dict[str, str]:
+def write_ablation_results(results: list[BenchResult], output_dir: str, suffix: str = "") -> dict[str, str]:
     """
     Write ablation results to CSV, Markdown, and JSON.
 
@@ -453,9 +457,9 @@ def write_ablation_results(results: list[BenchResult], output_dir: str) -> dict[
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    csv_path = out / "ablation_results.csv"
-    md_path = out / "ablation_results.md"
-    json_path = out / "ablation_results.json"
+    csv_path = out / f"ablation_results{suffix}.csv"
+    md_path = out / f"ablation_results{suffix}.md"
+    json_path = out / f"ablation_results{suffix}.json"
 
     # --- CSV ---
     fieldnames = list(BenchResult.__dataclass_fields__.keys())
@@ -596,6 +600,17 @@ def main(argv: list[str] | None = None) -> int:
         default=False,
         help="Verbose output",
     )
+    parser.add_argument(
+        "--real-embeddings",
+        action="store_true",
+        default=False,
+        help=(
+            "Use Waggle's real sentence-transformers embedding model (all-MiniLM-L6-v2) "
+            "instead of the deterministic hash-based model. "
+            "Required to isolate graph expansion and conflict resolution benefits. "
+            "First run downloads ~420 MB from HuggingFace."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -605,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     seeds = args.seeds if args.seeds else [args.seed]
+    use_real_embeddings = args.real_embeddings
 
     print("RMCA Ablation Study Runner")
     print(f"  variants     : {args.variants}")
@@ -612,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  scales       : {args.scales}")
     print(f"  seeds        : {seeds}")
     print(f"  token_budget : {args.token_budget}")
+    print(f"  embeddings   : {'real (all-MiniLM-L6-v2)' if use_real_embeddings else 'deterministic'}")
     print(f"  output       : {args.output}")
     print()
     print("WARNING: Results use synthetic data. Do not compare to RLM paper numerically.")
@@ -626,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             seeds=seeds,
             output_dir=args.output,
             verbose=args.verbose,
+            use_real_embeddings=use_real_embeddings,
         )
     else:
         results = run_ablation(
@@ -636,13 +654,16 @@ def main(argv: list[str] | None = None) -> int:
             seed=seeds[0],
             output_dir=args.output,
             verbose=args.verbose,
+            use_real_embeddings=use_real_embeddings,
         )
 
     if not results:
         print("No results produced.", file=sys.stderr)
         return 1
 
-    paths = write_ablation_results(results, args.output)
+    # Write to separate files when using real embeddings
+    output_suffix = "_real_emb" if use_real_embeddings else ""
+    paths = write_ablation_results(results, args.output, suffix=output_suffix)
     print("Ablation results written to:")
     for fmt, path in paths.items():
         print(f"  {fmt}: {path}")
