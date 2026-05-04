@@ -365,11 +365,9 @@ bug node, multi-project distractors).
 
 | benchmark_family | scale_n | method | score | evidence_coverage | tokens_returned | latency_ms |
 |---|---|---|---|---|---|---|
-| ContextReset | 128 | raw_context | 0.875 | 1.0 | 1994 | 2.4 |
-| ContextReset | 128 | query_graph | 0.0 | 0.0 | 76 | 4.6 |
-| ContextReset | 128 | build_context | 0.0 | 0.0 | 121 | 28.5 |
-| ContextReset | 128 | bm25_topk | 0.875 | 1.0 | 1994 | 2.4 |
-| ContextReset | 128 | hybrid_rrf | 0.875 | 1.0 | 1994 | 3.0 |
+| ContextReset | 128 | raw_context | 0.0 | 0.25 | 1413 | 5.2 |
+| ContextReset | 128 | query_graph | 0.0 | 0.0 | 76 | 8.8 |
+| ContextReset | 128 | build_context | 0.0 | 0.0 | 121 | 32.6 |
 
 **Key metric:** `active_decision_preference` — whether the method returns the
 latest active decision (source of the `updates` edge) rather than the superseded one.
@@ -475,18 +473,18 @@ Pipeline: method → context pack → `DeterministicAnswerer` → final answer �
 
 | benchmark_family | scale_n | method | answerer | final_answer_exact_match | final_answer_f1 | evidence_used | hallucination_rate | tokens_injected |
 |---|---|---|---|---|---|---|---|---|
-| pairwise | 128 | rmca_full | deterministic | 0.0 | 0.30769230769230765 | 0.3333333333333333 | 0.0 | 515 |
-| pairwise | 128 | query_graph | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 98 |
-| pairwise | 128 | bm25_topk | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 1422 |
-| pairwise | 128 | raw_context | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 1422 |
-| codeqa | 128 | rmca_full | deterministic | 1.0 | 0.6 | 1.0 | 0.0 | 535 |
-| codeqa | 128 | query_graph | deterministic | 1.0 | 0.5454545454545454 | 1.0 | 0.0 | 178 |
-| codeqa | 128 | bm25_topk | deterministic | 1.0 | 0.5454545454545454 | 1.0 | 0.0 | 1398 |
-| codeqa | 128 | raw_context | deterministic | 0.0 | 0.0 | 0.5 | 0.0 | 1382 |
-| context_reset | 128 | rmca_full | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 121 |
-| context_reset | 128 | query_graph | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 76 |
-| context_reset | 128 | bm25_topk | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 1413 |
-| context_reset | 128 | raw_context | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 1413 |
+| pairwise | 128 | rmca_full | groq | 0.0 | 0.6428571428571429 | 0.3333333333333333 | 0.0 | 515 |
+| pairwise | 128 | query_graph | groq | 0.0 | 0.0 | 0.0 | 0.0 | 98 |
+| pairwise | 128 | bm25_topk | groq | 0.0 | 0.0 | 0.0 | 1.0 | 1422 |
+| pairwise | 128 | raw_context | groq | 0.0 | 0.0 | 0.0 | 1.0 | 1422 |
+| codeqa | 128 | rmca_full | groq | 1.0 | 0.4 | 1.0 | 0.0 | 509 |
+| codeqa | 128 | query_graph | groq | 1.0 | 0.35294117647058826 | 1.0 | 0.0 | 150 |
+| codeqa | 128 | bm25_topk | groq | 1.0 | 0.3157894736842105 | 1.0 | 0.0 | 1398 |
+| codeqa | 128 | raw_context | groq | 0.0 | 0.1739130434782609 | 0.5 | 0.0 | 1382 |
+| context_reset | 128 | rmca_full | groq | 0.0 | 0.0 | 0.0 | 1.0 | 121 |
+| context_reset | 128 | query_graph | groq | 0.0 | 0.0 | 0.0 | 1.0 | 76 |
+| context_reset | 128 | bm25_topk | groq | 0.0 | 0.0 | 0.0 | 1.0 | 1413 |
+| context_reset | 128 | raw_context | groq | 0.0 | 0.0 | 0.0 | 1.0 | 1413 |
 
 
 ---

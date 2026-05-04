@@ -195,6 +195,67 @@ class OllamaAnswerer:
             return self._fallback.extract(context_pack, question, gold_answer)
 
 
+class GroqAnswerer:
+    """
+    LLM-based answerer using the Groq API.
+    Requires GROQ_API_KEY environment variable or explicit api_key parameter.
+    Falls back to DeterministicAnswerer if the API call fails.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "llama-3.3-70b-versatile",
+        max_tokens: int = 256,
+        timeout: float = 30.0,
+    ):
+        import os
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY", "")
+        self.model = model
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self._fallback = DeterministicAnswerer()
+
+    def extract(self, context_pack: str, question: str, gold_answer: str = "") -> str:
+        if not self.api_key:
+            LOGGER.warning("GroqAnswerer: no API key, falling back to DeterministicAnswerer")
+            return self._fallback.extract(context_pack, question, gold_answer)
+        try:
+            import json as _json
+            import urllib.request
+
+            prompt = (
+                f"You are a precise question-answering assistant.\n\n"
+                f"Context (retrieved memory):\n{context_pack}\n\n"
+                f"Question: {question}\n\n"
+                f"Answer in one sentence using only information from the context. "
+                f"If the context does not contain the answer, say 'Not found in context.'"
+            )
+            payload = _json.dumps({
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": self.max_tokens,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "waggle-mcp/1.0",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = _json.loads(resp.read().decode("utf-8"))
+            return str(body["choices"][0]["message"]["content"] or "").strip()
+        except Exception as exc:
+            LOGGER.warning("GroqAnswerer failed, falling back to DeterministicAnswerer: %s", exc)
+            return self._fallback.extract(context_pack, question, gold_answer)
+
+
 # ---------------------------------------------------------------------------
 # Metric functions
 # ---------------------------------------------------------------------------
@@ -343,6 +404,8 @@ def run_answer_level_eval(
     """
     if answerer_type == "ollama":
         answerer = OllamaAnswerer()
+    elif answerer_type == "groq":
+        answerer = GroqAnswerer()
     else:
         answerer = DeterministicAnswerer()
 
@@ -600,9 +663,10 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--answerer",
         default="deterministic",
-        choices=["deterministic", "ollama"],
+        choices=["deterministic", "ollama", "groq"],
     )
     parser.add_argument("--ollama-model", default="llama3.2")
+    parser.add_argument("--groq-model", default="llama-3.3-70b-versatile")
     parser.add_argument("--token-budget", type=int, default=1200)
     parser.add_argument("--output", default="benchmark_results")
     parser.add_argument("--verbose", "-v", action="store_true")
