@@ -546,6 +546,47 @@ models. The model is an answerer, not an independent human judge. The
 \texttt{DeterministicAnswerer} is a reproducible lower-bound evaluator; its scores are not
 equivalent to human preference ratings or LLM-judge quality assessments.
 
+\subsection{Two-Model Answer-Level Comparison}
+
+To partially address the single-model limitation, we replicated the pairwise answer-level
+evaluation with a second Groq model: \texttt{llama-3.1-8b-instant} (8B parameters, faster
+and cheaper than the 70B model). Table~\ref{tab:two_model} shows the comparison across
+3 seeds and 2 scales.
+
+\begin{table}[htbp]
+\caption{Two-Model Answer-Level Comparison --- Pairwise Conflict Task\\
+(seeds 42/43/44, scales 128/512; values consistent across all seeds)}
+\label{tab:two_model}
+\centering
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Model} & \textbf{Method} & \textbf{EM} & \textbf{F1} & \textbf{Hall.} & \textbf{Tokens} \\
+\midrule
+\texttt{llama-3.3-70b} & \texttt{rmca\_full}   & \textbf{1.00} & \textbf{1.00} & \textbf{0.00} & 435--515 \\
+\texttt{llama-3.3-70b} & \texttt{query\_graph} & 0.00 & 0.00 & 0.00 & 98 \\
+\texttt{llama-3.3-70b} & \texttt{bm25\_topk}   & 0.00 & 0.00--0.12 & 0.00--1.00 & 1390--1422 \\
+\texttt{llama-3.3-70b} & \texttt{raw\_context} & 0.00 & 0.00--0.12 & 0.00--1.00 & 1390--1422 \\
+\texttt{llama-3.3-70b} & \texttt{hybrid\_rrf}  & 0.00 & 0.00--0.12 & 0.00--1.00 & 1389--1422 \\
+\midrule
+\texttt{llama-3.1-8b}  & \texttt{rmca\_full}   & \textbf{1.00} & \textbf{1.00} & \textbf{0.00} & 435--515 \\
+\texttt{llama-3.1-8b}  & \texttt{query\_graph} & 0.00 & 0.00 & 0.00 & 98 \\
+\texttt{llama-3.1-8b}  & \texttt{bm25\_topk}   & 0.00 & 0.00--0.12 & 0.00--1.00 & 1390--1422 \\
+\texttt{llama-3.1-8b}  & \texttt{raw\_context} & 0.00 & 0.00--0.12 & 0.00--1.00 & 1390--1422 \\
+\texttt{llama-3.1-8b}  & \texttt{hybrid\_rrf}  & 0.00 & 0.00--0.12 & 0.00--1.00 & 1389--1422 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pattern is identical across both models: \texttt{rmca\_full} achieves EM=1.0, F1=1.0,
+hallucination=0.0 at both scales and all 3 seeds; all flat baselines score EM=0.0.
+This replication across a 70B and an 8B model strengthens the finding that RMCA's
+structured context pack is more answerable than flat context dumps on pairwise conflict
+tasks, independent of model size.
+
+\textbf{Caveat.} Both models are from the same provider (Groq) and the same model family
+(Llama). Replication across different model families (e.g., Gemini, Claude, GPT) and
+human evaluation remains future work.
+
 \subsection{Ablation Study}
 
 To identify which RMCA components are load-bearing, we ran a systematic ablation study
@@ -710,7 +751,7 @@ the scope of our contributions.
 \toprule
 \textbf{Claim} & \textbf{Status} & \textbf{Evidence} & \textbf{Caveat} \\
 \midrule
-RMCA improves pairwise answerability & \textbf{Supported} & Groq eval: EM/F1=1.0, hall=0.0 across 3 seeds $\times$ 2 scales & Synthetic pairwise task; one answer model \\
+RMCA improves pairwise answerability & \textbf{Supported} & Groq eval: EM/F1=1.0, hall=0.0 across 3 seeds $\times$ 2 scales, replicated on 70B and 8B models & Synthetic pairwise task; same model family (Llama/Groq) \\
 \midrule
 Decomposition is load-bearing & \textbf{Supported} & \texttt{no\_decomposition} and \texttt{random\_subqueries} drop 1.0$\to$0.0 & Current synthetic tasks only \\
 \midrule
@@ -798,13 +839,13 @@ retrieval surfaces conflict nodes without edge traversal. Isolating these compon
 requires a benchmark with semantically indistinguishable node labels and a scorer that
 requires explicit conflict annotation in the context pack.
 
-\item \textbf{LLM answer-level evaluation uses a single model.}
-The Groq \texttt{llama-3.3-70b-versatile} answer-level results use one answering model and
-should be replicated across models. A second-model run with \texttt{llama-3.1-8b-instant}
-was deferred because \texttt{GROQ\_API\_KEY} was not available in the evaluation environment.
-The model is an answerer, not an independent human judge. The
-\texttt{DeterministicAnswerer} is a reproducible lower-bound evaluator; its scores are not
-equivalent to human preference ratings or LLM-judge quality assessments.
+\item \textbf{LLM answer-level evaluation uses models from one family.}
+The answer-level evaluation was replicated on two Groq models: \texttt{llama-3.3-70b-versatile}
+and \texttt{llama-3.1-8b-instant}. Both produce identical results (EM=1.0 for \texttt{rmca\_full},
+EM=0.0 for all flat baselines). However, both models are from the same provider (Groq) and
+the same model family (Llama). Replication across different model families (Gemini, Claude,
+GPT) and human evaluation remains future work. The models are answerers, not independent
+human judges.
 
 \item \textbf{LongMemEval scope.} The adapter evaluates session retrieval only. End-to-end
 graph extraction quality, contradiction handling across sessions, and context-bundle
