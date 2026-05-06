@@ -16,7 +16,7 @@ import uuid
 import webbrowser
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,8 @@ from waggle.rlm import (
     run_groq_one_shot,
 )
 from waggle.models import (
+    ApiKeyRecord,
+    AuditEventRecord,
     ConflictEntry,
     ConflictListResult,
     ContextBundleExportResult,
@@ -78,13 +80,16 @@ from waggle.models import (
     ObservationResult,
     PrimeContextResult,
     RelationType,
+    RetentionPolicyRecord,
+    RetentionPruneRunRecord,
     SubgraphResult,
     TimelineResult,
     TopicResult,
     TranscriptIngestionInput,
     TranscriptMessage,
+    utc_now,
 )
-from waggle.plus import detect_plus
+from waggle.plus import PlusStatus, detect_plus, has_plus_capability, load_identity_provider
 from waggle.rate_limit import RateLimiter
 from waggle.runtime_context import runtime_context
 from waggle.recursive_context import (
@@ -220,6 +225,82 @@ def _resolve_drive_token_path(args: argparse.Namespace, config: AppConfig) -> Pa
         return Path(raw).expanduser()
     export_root = Path(config.export_dir).expanduser() if config.export_dir else Path.home() / ".waggle"
     return export_root / "google-drive-token.json"
+
+
+def _serialize_api_key_record(record: ApiKeyRecord) -> dict[str, Any]:
+    return {
+        "api_key_id": record.api_key_id,
+        "tenant_id": record.tenant_id,
+        "prefix": record.prefix,
+        "name": record.name,
+        "status": record.status,
+        "created_at": record.created_at.isoformat(),
+        "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+        "revoked_at": record.revoked_at.isoformat() if record.revoked_at else None,
+        "last_used_at": record.last_used_at.isoformat() if record.last_used_at else None,
+        "created_by": record.created_by,
+        "scopes": record.scopes,
+    }
+
+
+def _serialize_retention_policy(record: RetentionPolicyRecord) -> dict[str, Any]:
+    next_due_at = None
+    if record.last_pruned_at is not None:
+        next_due_at = record.last_pruned_at + timedelta(hours=record.prune_interval_hours)
+    return {
+        "tenant_id": record.tenant_id,
+        "enabled": record.enabled,
+        "retention_days": record.retention_days,
+        "prune_interval_hours": record.prune_interval_hours,
+        "last_pruned_at": record.last_pruned_at.isoformat() if record.last_pruned_at else None,
+        "next_due_at": next_due_at.isoformat() if next_due_at else None,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+def _serialize_retention_run(record: RetentionPruneRunRecord) -> dict[str, Any]:
+    return {
+        "run_id": record.run_id,
+        "tenant_id": record.tenant_id,
+        "status": record.status,
+        "cutoff": record.cutoff.isoformat(),
+        "started_at": record.started_at.isoformat(),
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "deleted_nodes": record.deleted_nodes,
+        "deleted_edges": record.deleted_edges,
+        "deleted_transcripts": record.deleted_transcripts,
+        "deleted_context_windows": record.deleted_context_windows,
+        "deleted_context_window_edges": record.deleted_context_window_edges,
+        "deleted_exports": record.deleted_exports,
+        "duration_ms": record.duration_ms,
+        "error_message": record.error_message,
+    }
+
+
+def _serialize_audit_event(record: AuditEventRecord) -> dict[str, Any]:
+    return {
+        "event_id": record.event_id,
+        "tenant_id": record.tenant_id,
+        "event_type": record.event_type,
+        "actor_type": record.actor_type,
+        "actor_id": record.actor_id,
+        "api_key_id": record.api_key_id,
+        "resource_type": record.resource_type,
+        "resource_id": record.resource_id,
+        "action": record.action,
+        "status": record.status,
+        "ip_address": record.ip_address,
+        "user_agent": record.user_agent,
+        "created_at": record.created_at.isoformat(),
+        "metadata": record.metadata,
+    }
+
+
+def _parse_api_key_scopes(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
 
 
 def _require_drive_sync() -> None:
@@ -2576,8 +2657,22 @@ class MCPHttpApp:
             scope["state"]["tenant_id"] = principal.tenant_id
             scope["state"]["api_key_id"] = principal.api_key_id
             scope["state"]["request_id"] = request_id
+            tenant_graph = self.app_server._root_graph.for_tenant(principal.tenant_id)
+            tenant_graph.emit_audit_event(
+                event_type="api_key.used",
+                actor_type="api_key",
+                actor_id=principal.name or principal.api_key_id,
+                api_key_id=principal.api_key_id,
+                resource_type="mcp_request",
+                resource_id=request_id,
+                action="use",
+                ip_address=scope.get("client", ("", 0))[0] or "",
+                user_agent=headers.get("user-agent", ""),
+                metadata={"method": method, "tool_name": self._extract_tool_name(body)},
+            )
 
             tool_name = self._extract_tool_name(body)
+            principal.require_scope("graph:write" if tool_name in WRITE_HEAVY_TOOLS else "graph:read")
             await self.rate_limiter.check_rate(principal.api_key_id, is_write=tool_name in WRITE_HEAVY_TOOLS)
             async with self.rate_limiter.concurrency_slot(principal.api_key_id):
                 with runtime_context(
@@ -2639,6 +2734,13 @@ class MCPHttpApp:
 def create_http_application(app_server: WaggleServer, config: AppConfig) -> Starlette:
     service = MCPHttpApp(app_server, config)
 
+    async def waggle_error_handler(request: Request, exc: WaggleError) -> Response:
+        if isinstance(exc, AuthenticationError):
+            service.metrics.increment("waggle_auth_failures_total")
+        if exc.code == "rate_limited":
+            service.metrics.increment("waggle_rate_limit_rejections_total")
+        return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=exc.status_code)
+
     async def live(_: Request) -> Response:
         return JSONResponse({"status": "live"})
 
@@ -2658,8 +2760,81 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             "session_id": request.query_params.get("session_id", "").strip(),
         }
 
-    def _build_scoped_abhi(scope: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
-        snapshot = app_server.graph.get_graph_snapshot(**scope)
+    def _graph_from_request(request: Request, *, tenant_override: str = "") -> tuple[Any, Any | None]:
+        raw_api_key = request.headers.get("x-api-key", "").strip()
+        if raw_api_key:
+            principal = app_server._root_graph.authenticate_api_key(raw_api_key)
+            return app_server._root_graph.for_tenant(principal.tenant_id), principal
+        tenant_id = tenant_override.strip() or request.query_params.get("tenant_id", "").strip() or config.default_tenant_id
+        return app_server.graph.for_tenant(tenant_id), None
+
+    def _emit_http_audit(
+        request: Request,
+        *,
+        event_type: str,
+        resource_type: str,
+        resource_id: str = "",
+        action: str = "",
+        metadata: dict[str, Any] | None = None,
+        tenant_override: str = "",
+    ) -> None:
+        try:
+            graph, principal = _graph_from_request(request, tenant_override=tenant_override)
+        except AuthenticationError:
+            graph = app_server.graph.for_tenant(tenant_override.strip() or config.default_tenant_id)
+            principal = None
+        graph.emit_audit_event(
+            event_type=event_type,
+            actor_type="api_key" if principal is not None else "admin",
+            actor_id=(principal.name or principal.api_key_id) if principal is not None else "local-http",
+            api_key_id=principal.api_key_id if principal is not None else "",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            action=action or event_type,
+            ip_address=request.client.host if request.client else "",
+            user_agent=request.headers.get("user-agent", ""),
+            metadata=metadata or {},
+        )
+
+    def _require_http_scope(request: Request, required_scope: str, *, tenant_override: str = "") -> tuple[Any, Any | None]:
+        graph, principal = _graph_from_request(request, tenant_override=tenant_override)
+        if principal is not None:
+            principal.require_scope(required_scope)
+        return graph, principal
+
+    def _plus_identity_provider_response() -> tuple[PlusStatus, Any | None, JSONResponse | None]:
+        status, provider = load_identity_provider()
+        if not status.installed:
+            return status, None, JSONResponse(
+                {
+                    "error": "plus_required",
+                    "message": "Waggle Plus identity integration is coming soon.",
+                    "plus": status.as_dict(),
+                },
+                status_code=501,
+            )
+        if not has_plus_capability("oidc_sso"):
+            return status, None, JSONResponse(
+                {
+                    "error": "plus_capability_missing",
+                    "message": "Installed Waggle Plus module does not advertise OIDC SSO support.",
+                    "plus": status.as_dict(),
+                },
+                status_code=501,
+            )
+        if provider is None:
+            return status, None, JSONResponse(
+                {
+                    "error": "plus_provider_missing",
+                    "message": "Waggle Plus is installed but did not provide an identity provider.",
+                    "plus": status.as_dict(),
+                },
+                status_code=500,
+            )
+        return status, provider, None
+
+    def _build_scoped_abhi(graph: Any, scope: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        snapshot = graph.get_graph_snapshot(**scope)
         return snapshot, build_abhi_document(snapshot)
 
     def _validate_live_snapshot(snapshot: dict[str, Any]) -> None:
@@ -2744,12 +2919,19 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_snapshot(request: Request) -> Response:
         scope = _scope_from_request(request)
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:read")
         include_source_prompt = request.query_params.get("include_source_prompt", "").strip().lower() in {"1", "true", "yes"}
         try:
             snapshot = graph.get_graph_snapshot(include_source_prompt=include_source_prompt, **scope)
         except TypeError:
             snapshot = graph.get_graph_snapshot(**scope)
+        _emit_http_audit(
+            request,
+            event_type="graph.snapshot.read",
+            resource_type="graph_snapshot",
+            action="read",
+            metadata={"project": scope["project"], "agent_id": scope["agent_id"], "session_id": scope["session_id"]},
+        )
         return JSONResponse(
             {
                 "tenant_id": snapshot.get("tenant_id", ""),
@@ -2766,9 +2948,16 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         scope = _scope_from_request(request)
         limit = int(request.query_params.get("limit", "200") or "200")
         query_text = request.query_params.get("query", "").strip()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:read")
         if query_text and hasattr(graph, "search_transcript_records"):
             hits = graph.search_transcript_records(query=query_text, limit=limit, **scope)
+            _emit_http_audit(
+                request,
+                event_type="record.read",
+                resource_type="transcript_records",
+                action="read",
+                metadata={"mode": "hybrid", "query": query_text, "limit": limit},
+            )
             return JSONResponse(
                 {
                     "mode": "hybrid",
@@ -2779,6 +2968,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         if not hasattr(graph, "list_transcript_records"):
             raise ValidationFailure("Transcript listing is not available in this backend.")
         records = graph.list_transcript_records(limit=limit, **scope)
+        _emit_http_audit(
+            request,
+            event_type="record.read",
+            resource_type="transcript_records",
+            action="read",
+            metadata={"mode": "chronological", "limit": limit},
+        )
         return JSONResponse(
             {
                 "mode": "chronological",
@@ -2798,7 +2994,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             raise ValidationFailure("query is required.")
         max_nodes = int(payload.get("max_nodes", 8) or 8)
         max_depth = int(payload.get("max_depth", 1) or 1)
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:read")
         debug = graph.debug_retrieval(query=query_text, max_nodes=max_nodes, max_depth=max_depth, retrieval_mode="hybrid", **scope)
         fusion = graph.query(
             query=query_text,
@@ -2834,6 +3030,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
                     "reasoning": ", ".join(reasoning) or "ranked by reciprocal-rank fusion",
                 }
             )
+        _emit_http_audit(
+            request,
+            event_type="graph.query.executed",
+            resource_type="retrieval_debug",
+            action="read",
+            metadata={"query": query_text, "max_nodes": max_nodes, "max_depth": max_depth},
+        )
         return JSONResponse(
             {
                 "debug": debug,
@@ -2845,8 +3048,16 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_abhi_preview(request: Request) -> Response:
         scope = _scope_from_request(request)
-        snapshot, document = _build_scoped_abhi(scope)
+        graph, _ = _require_http_scope(request, "graph:read")
+        snapshot, document = _build_scoped_abhi(graph, scope)
         validation = validate_abhi_document(document, input_path="live://graph")
+        _emit_http_audit(
+            request,
+            event_type="export.previewed",
+            resource_type="abhi_preview",
+            action="read",
+            metadata={"project": scope["project"], "agent_id": scope["agent_id"], "session_id": scope["session_id"]},
+        )
         return JSONResponse(
             {
                 "tenant_id": snapshot.get("tenant_id", ""),
@@ -2863,22 +3074,41 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_query(request: Request) -> Response:
         payload = await request.json()
+        graph, _ = _require_http_scope(request, "graph:read")
         scope = {
             "project": str(payload.get("project", "")).strip(),
             "agent_id": str(payload.get("agent_id", "")).strip(),
             "session_id": str(payload.get("session_id", "")).strip(),
         }
-        _, document = _build_scoped_abhi(scope)
+        _, document = _build_scoped_abhi(graph, scope)
         result = execute_abhi_query(
             document,
             query_id=str(payload.get("query_id", "")).strip(),
             query_text=str(payload.get("query", "")).strip(),
         )
+        _emit_http_audit(
+            request,
+            event_type="graph.query.executed",
+            resource_type="abhi_query",
+            action="read",
+            metadata={
+                "query_id": str(payload.get("query_id", "")).strip(),
+                "query": str(payload.get("query", "")).strip(),
+            },
+        )
         return JSONResponse(result)
 
     async def graph_diff_feed(request: Request) -> Response:
         since = request.query_params.get("since", "24h").strip() or "24h"
-        diff = app_server.graph.graph_diff(since=since)
+        graph, _ = _require_http_scope(request, "graph:read")
+        diff = graph.graph_diff(since=since)
+        _emit_http_audit(
+            request,
+            event_type="graph.diff.read",
+            resource_type="graph_diff",
+            action="read",
+            metadata={"since": since},
+        )
         return JSONResponse(
             {
                 "since": diff.since,
@@ -2891,7 +3121,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_save_ui(request: Request) -> Response:
         payload = await request.json()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         saved = graph.save_ui_state(
             project=str(payload.get("project", "")).strip(),
             agent_id=str(payload.get("agent_id", "")).strip(),
@@ -2912,7 +3142,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             "agent_id": str(payload.get("agent_id", "")).strip(),
             "session_id": str(payload.get("session_id", "")).strip(),
         }
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         current = graph.get_graph_snapshot(**scope)
         desired_nodes = {
             str(node.get("id", "")).strip(): node
@@ -3005,7 +3235,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_create_node(request: Request) -> Response:
         payload = await request.json()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         scope = {
             "project": str(payload.get("project", "")).strip(),
             "agent_id": str(payload.get("agent_id", "")).strip(),
@@ -3029,7 +3259,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
     async def graph_update_node(request: Request) -> Response:
         node_id = request.path_params["node_id"]
         payload = await request.json()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         snapshot = graph.get_graph_snapshot()
         existing = next((node for node in snapshot.get("nodes", []) if str(node.get("id", "")).strip() == node_id), None)
         if existing is None:
@@ -3051,13 +3281,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_delete_node(request: Request) -> Response:
         node_id = request.path_params["node_id"]
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         deleted = graph.delete_node(node_id=node_id)
         return JSONResponse(deleted.model_dump(mode="json"))
 
     async def graph_create_edge(request: Request) -> Response:
         payload = await request.json()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         snapshot = graph.get_graph_snapshot()
         snapshot["edges"] = [*snapshot.get("edges", []), _edge_snapshot_payload(snapshot=snapshot, payload=payload)]
         _validate_live_snapshot(snapshot)
@@ -3073,7 +3303,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
     async def graph_update_edge(request: Request) -> Response:
         edge_id = request.path_params["edge_id"]
         payload = await request.json()
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:write")
         snapshot = graph.get_graph_snapshot()
         existing = next((item for item in snapshot.get("edges", []) if str(item.get("id", "")).strip() == edge_id), None)
         if existing is None:
@@ -3096,7 +3326,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
 
     async def graph_delete_edge(request: Request) -> Response:
         edge_id = request.path_params["edge_id"]
-        graph = app_server.graph
+        graph, _ = _require_http_scope(request, "graph:read")
         edge = graph.delete_edge(edge_id=edge_id)
         return JSONResponse(edge.model_dump(mode="json"))
 
@@ -3107,6 +3337,14 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         if export_format == "abhi":
             exported = graph.export_abhi(**scope)
             content = Path(exported.output_path).read_bytes()
+            _emit_http_audit(
+                request,
+                event_type="export.downloaded",
+                resource_type="abhi_export",
+                resource_id=exported.output_path,
+                action="download",
+                metadata={"format": "abhi", "project": scope["project"]},
+            )
             return Response(
                 content,
                 media_type="application/octet-stream",
@@ -3114,6 +3352,13 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             )
         if export_format == "json":
             snapshot = graph.get_graph_snapshot(**scope)
+            _emit_http_audit(
+                request,
+                event_type="export.downloaded",
+                resource_type="backup",
+                action="download",
+                metadata={"format": "json", "project": scope["project"]},
+            )
             return Response(
                 json.dumps(snapshot, indent=2),
                 media_type="application/json",
@@ -3134,7 +3379,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
                 temp_path.write_bytes(base64.b64decode(content_base64))
             else:
                 temp_path.write_text(content, encoding="utf-8")
-            graph = app_server.graph
+            graph, _ = _require_http_scope(request, "graph:write")
             imported_node_ids: list[str] = []
             if import_format == "abhi":
                 document = load_abhi_document(temp_path)
@@ -3163,7 +3408,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
                 temp_path.write_bytes(base64.b64decode(content_base64))
             else:
                 temp_path.write_text(content, encoding="utf-8")
-            graph = app_server.graph
+            graph, _ = _require_http_scope(request, "graph:read")
             if import_format == "abhi":
                 validation = graph.validate_abhi(input_path=temp_path)
                 inspect_result = graph.inspect_abhi(input_path=temp_path)
@@ -3215,7 +3460,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
                 path_b.write_bytes(base64.b64decode(content_b_base64))
             else:
                 path_b.write_text(content_b, encoding="utf-8")
-            graph = app_server.graph
+            graph, _ = _require_http_scope(request, "graph:read")
             diff = graph.diff_abhi(input_path_a=path_a, input_path_b=path_b)
             snapshot_a = abhi_to_snapshot(load_abhi_document(path_a), fallback_tenant_id=graph.tenant_id)
             snapshot_b = abhi_to_snapshot(load_abhi_document(path_b), fallback_tenant_id=graph.tenant_id)
@@ -3229,6 +3474,125 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         finally:
             path_a.unlink(missing_ok=True)
             path_b.unlink(missing_ok=True)
+
+    async def admin_retention_status(request: Request) -> Response:
+        graph, _ = _require_http_scope(request, "admin:read")
+        policy = graph.get_retention_policy(
+            default_enabled=config.retention_enabled,
+            default_retention_days=config.retention_days,
+            default_prune_interval_hours=config.retention_prune_interval_hours,
+        )
+        payload = _serialize_retention_policy(policy)
+        payload["recent_runs"] = [_serialize_retention_run(run) for run in graph.list_retention_runs(limit=5)]
+        return JSONResponse(payload)
+
+    async def admin_retention_update(request: Request) -> Response:
+        payload = await request.json()
+        graph, principal = _require_http_scope(request, "admin:write", tenant_override=str(payload.get("tenant_id", "") or ""))
+        policy = graph.update_retention_policy(
+            enabled=payload.get("enabled"),
+            retention_days=payload.get("retention_days"),
+            prune_interval_hours=payload.get("prune_interval_hours"),
+            default_enabled=config.retention_enabled,
+            default_retention_days=config.retention_days,
+            default_prune_interval_hours=config.retention_prune_interval_hours,
+        )
+        graph.emit_audit_event(
+            event_type="retention.policy.updated",
+            actor_type="api_key" if principal is not None else "admin",
+            actor_id=(principal.name or principal.api_key_id) if principal is not None else "local-http",
+            api_key_id=principal.api_key_id if principal is not None else "",
+            resource_type="retention_policy",
+            resource_id=policy.tenant_id,
+            action="update",
+            metadata={
+                "enabled": policy.enabled,
+                "retention_days": policy.retention_days,
+                "prune_interval_hours": policy.prune_interval_hours,
+            },
+            ip_address=request.client.host if request.client else "",
+            user_agent=request.headers.get("user-agent", ""),
+        )
+        return JSONResponse(_serialize_retention_policy(policy))
+
+    async def admin_retention_prune(request: Request) -> Response:
+        payload = await request.json() if request.method != "GET" else {}
+        graph, _ = _require_http_scope(request, "admin:write", tenant_override=str(payload.get("tenant_id", "") or ""))
+        run = graph.prune_retention(
+            batch_size=int(payload.get("batch_size", 1000) or 1000),
+            default_enabled=config.retention_enabled,
+            default_retention_days=config.retention_days,
+            default_prune_interval_hours=config.retention_prune_interval_hours,
+        )
+        response = _serialize_retention_run(run)
+        response["policy"] = _serialize_retention_policy(
+            graph.get_retention_policy(
+                default_enabled=config.retention_enabled,
+                default_retention_days=config.retention_days,
+                default_prune_interval_hours=config.retention_prune_interval_hours,
+            )
+        )
+        return JSONResponse(response)
+
+    async def admin_retention_runs(request: Request) -> Response:
+        graph, _ = _require_http_scope(request, "admin:read")
+        limit = int(request.query_params.get("limit", "20") or "20")
+        runs = graph.list_retention_runs(limit=limit)
+        return JSONResponse([_serialize_retention_run(run) for run in runs])
+
+    async def admin_audit_events(request: Request) -> Response:
+        graph, _ = _require_http_scope(request, "admin:read")
+        limit = int(request.query_params.get("limit", "100") or "100")
+        events = graph.list_audit_events(
+            limit=limit,
+            event_type=request.query_params.get("type", "").strip(),
+            actor_id=request.query_params.get("actor_id", "").strip(),
+            resource_id=request.query_params.get("resource_id", "").strip(),
+            resource_type=request.query_params.get("resource_type", "").strip(),
+            status=request.query_params.get("status", "").strip(),
+        )
+        return JSONResponse([_serialize_audit_event(event) for event in events])
+
+    async def admin_identity_provider(request: Request) -> Response:
+        _require_http_scope(request, "admin:read")
+        status, provider, error_response = _plus_identity_provider_response()
+        if error_response is not None:
+            return error_response
+        status_payload = provider.status() if hasattr(provider, "status") and callable(provider.status) else {}
+        return JSONResponse(
+            {
+                "plus": status.as_dict(),
+                "provider": status_payload,
+            }
+        )
+
+    async def admin_identity_authorize(request: Request) -> Response:
+        payload = await request.json()
+        _require_http_scope(request, "admin:read")
+        status, provider, error_response = _plus_identity_provider_response()
+        if error_response is not None:
+            return error_response
+        authorize_url_fn = getattr(provider, "authorize_url", None)
+        if not callable(authorize_url_fn):
+            return JSONResponse(
+                {
+                    "error": "plus_provider_missing_method",
+                    "message": "Identity provider does not expose authorize_url().",
+                    "plus": status.as_dict(),
+                },
+                status_code=500,
+            )
+        redirect_uri = str(payload.get("redirect_uri", "")).strip()
+        state = str(payload.get("state", "")).strip()
+        if not redirect_uri:
+            raise ValidationFailure("redirect_uri is required.")
+        authorize_url = authorize_url_fn(redirect_uri=redirect_uri, state=state)
+        return JSONResponse(
+            {
+                "authorize_url": str(authorize_url),
+                "plus": status.as_dict(),
+            }
+        )
 
     app = Starlette(
         routes=[
@@ -3254,10 +3618,18 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             Route("/api/graph/edges/{edge_id:str}", graph_delete_edge, methods=["DELETE"]),
             Route("/api/graph/export", graph_export, methods=["GET"]),
             Route("/api/graph/import", graph_import, methods=["POST"]),
+            Route("/api/admin/retention", admin_retention_status, methods=["GET"]),
+            Route("/api/admin/retention", admin_retention_update, methods=["PUT", "PATCH"]),
+            Route("/api/admin/retention/prune", admin_retention_prune, methods=["POST"]),
+            Route("/api/admin/retention/runs", admin_retention_runs, methods=["GET"]),
+            Route("/api/admin/audit-events", admin_audit_events, methods=["GET"]),
+            Route("/api/admin/identity/provider", admin_identity_provider, methods=["GET"]),
+            Route("/api/admin/identity/authorize", admin_identity_authorize, methods=["POST"]),
             Mount("/graph-assets", app=StaticFiles(packages=[("waggle", "static/graph")], html=False, check_dir=False)),
             Mount("/mcp", app=service.mcp_asgi),
         ],
         lifespan=service.lifespan,
+        exception_handlers={WaggleError: waggle_error_handler},
     )
     return app
 
@@ -3479,12 +3851,42 @@ def _build_parser() -> argparse.ArgumentParser:
     create_api_key = subparsers.add_parser("create-api-key", help="Issue an API key for a tenant.")
     create_api_key.add_argument("--tenant-id", required=True)
     create_api_key.add_argument("--name", default="")
+    create_api_key.add_argument("--expires-in-days", type=int, default=0)
+    create_api_key.add_argument("--created-by", default="")
+    create_api_key.add_argument("--scopes", default="graph:read,graph:write,admin:read,admin:write")
 
     list_api_keys = subparsers.add_parser("list-api-keys", help="List API keys for a tenant.")
     list_api_keys.add_argument("--tenant-id", required=True)
 
     revoke_api_key = subparsers.add_parser("revoke-api-key", help="Revoke an API key.")
     revoke_api_key.add_argument("--api-key-id", required=True)
+    revoke_api_key.add_argument("--tenant-id", default="")
+
+    retention_status = subparsers.add_parser("retention-status", help="Show the active retention policy for a tenant.")
+    retention_status.add_argument("--tenant-id", default="")
+
+    set_retention = subparsers.add_parser("set-retention", help="Create or update the retention policy for a tenant.")
+    set_retention.add_argument("--tenant-id", default="")
+    set_retention.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None)
+    set_retention.add_argument("--days", type=int, default=None)
+    set_retention.add_argument("--interval-hours", type=int, default=None)
+
+    prune_retention = subparsers.add_parser("prune-retention", help="Run retention pruning immediately for a tenant.")
+    prune_retention.add_argument("--tenant-id", default="")
+    prune_retention.add_argument("--batch-size", type=int, default=1000)
+
+    list_retention_runs = subparsers.add_parser("list-retention-runs", help="List recent retention prune runs for a tenant.")
+    list_retention_runs.add_argument("--tenant-id", default="")
+    list_retention_runs.add_argument("--limit", type=int, default=20)
+
+    list_audit_events = subparsers.add_parser("list-audit-events", help="List recent audit events for a tenant.")
+    list_audit_events.add_argument("--tenant-id", default="")
+    list_audit_events.add_argument("--limit", type=int, default=100)
+    list_audit_events.add_argument("--type", dest="event_type", default="")
+    list_audit_events.add_argument("--actor-id", default="")
+    list_audit_events.add_argument("--resource-id", default="")
+    list_audit_events.add_argument("--resource-type", default="")
+    list_audit_events.add_argument("--status", default="")
 
     migrate_sqlite = subparsers.add_parser("migrate-sqlite", help="Export a SQLite graph and import it into the configured Neo4j backend.")
     migrate_sqlite.add_argument("--db-path", required=True)
@@ -3918,14 +4320,41 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(json.dumps(tenant.model_dump(), indent=2))
         return 0
     if args.command == "create-api-key":
-        created = backend.create_api_key(args.tenant_id, args.name)
+        expires_in_days = int(getattr(args, "expires_in_days", 0) or 0)
+        expires_at = utc_now() + timedelta(days=expires_in_days) if expires_in_days > 0 else None
+        tenant_backend = backend.for_tenant(args.tenant_id)
+        created = tenant_backend.create_api_key(
+            args.tenant_id,
+            args.name,
+            expires_at=expires_at,
+            created_by=str(getattr(args, "created_by", "") or "").strip(),
+            scopes=_parse_api_key_scopes(getattr(args, "scopes", "")) or None,
+        )
+        tenant_backend.emit_audit_event(
+            event_type="api_key.created",
+            actor_type="admin",
+            actor_id=str(getattr(args, "created_by", "") or "").strip() or "local-cli",
+            resource_type="api_key",
+            resource_id=created.record.api_key_id,
+            action="create",
+            metadata={
+                "name": created.record.name,
+                "prefix": created.record.prefix,
+                "expires_at": created.record.expires_at.isoformat() if created.record.expires_at else None,
+                "scopes": created.record.scopes,
+            },
+        )
         print(
             json.dumps(
                 {
                     "api_key_id": created.record.api_key_id,
                     "tenant_id": created.record.tenant_id,
+                    "prefix": created.record.prefix,
                     "name": created.record.name,
                     "status": created.record.status,
+                    "expires_at": created.record.expires_at.isoformat() if created.record.expires_at else None,
+                    "created_by": created.record.created_by,
+                    "scopes": created.record.scopes,
                     "raw_api_key": created.raw_api_key,
                 },
                 indent=2,
@@ -3933,11 +4362,78 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "list-api-keys":
-        print(json.dumps([record.model_dump(mode="json") for record in backend.list_api_keys(args.tenant_id)], indent=2))
+        print(json.dumps([_serialize_api_key_record(record) for record in backend.list_api_keys(args.tenant_id)], indent=2))
         return 0
     if args.command == "revoke-api-key":
-        backend.revoke_api_key(args.api_key_id)
+        tenant_backend = backend.for_tenant(getattr(args, "tenant_id", "") or config.default_tenant_id)
+        tenant_backend.revoke_api_key(args.api_key_id)
+        tenant_backend.emit_audit_event(
+            event_type="api_key.revoked",
+            actor_type="admin",
+            actor_id="local-cli",
+            resource_type="api_key",
+            resource_id=args.api_key_id,
+            action="revoke",
+        )
         print(json.dumps({"revoked": args.api_key_id}))
+        return 0
+    if args.command in {"retention-status", "set-retention", "prune-retention", "list-retention-runs", "list-audit-events"}:
+        retention_backend = backend.for_tenant(getattr(args, "tenant_id", "") or config.default_tenant_id)
+        policy_kwargs = {
+            "default_enabled": config.retention_enabled,
+            "default_retention_days": config.retention_days,
+            "default_prune_interval_hours": config.retention_prune_interval_hours,
+        }
+        if args.command == "retention-status":
+            policy = retention_backend.get_retention_policy(**policy_kwargs)
+            payload = _serialize_retention_policy(policy)
+            payload["recent_runs"] = [_serialize_retention_run(run) for run in retention_backend.list_retention_runs(limit=5)]
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.command == "set-retention":
+            policy = retention_backend.update_retention_policy(
+                enabled=getattr(args, "enabled", None),
+                retention_days=getattr(args, "days", None),
+                prune_interval_hours=getattr(args, "interval_hours", None),
+                **policy_kwargs,
+            )
+            retention_backend.emit_audit_event(
+                event_type="retention.policy.updated",
+                actor_type="admin",
+                actor_id="local-cli",
+                resource_type="retention_policy",
+                resource_id=policy.tenant_id,
+                action="update",
+                metadata={
+                    "enabled": policy.enabled,
+                    "retention_days": policy.retention_days,
+                    "prune_interval_hours": policy.prune_interval_hours,
+                },
+            )
+            print(json.dumps(_serialize_retention_policy(policy), indent=2))
+            return 0
+        if args.command == "prune-retention":
+            run = retention_backend.prune_retention(
+                batch_size=getattr(args, "batch_size", 1000),
+                **policy_kwargs,
+            )
+            payload = _serialize_retention_run(run)
+            payload["policy"] = _serialize_retention_policy(retention_backend.get_retention_policy(**policy_kwargs))
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.command == "list-audit-events":
+            events = retention_backend.list_audit_events(
+                limit=getattr(args, "limit", 100),
+                event_type=getattr(args, "event_type", ""),
+                actor_id=getattr(args, "actor_id", ""),
+                resource_id=getattr(args, "resource_id", ""),
+                resource_type=getattr(args, "resource_type", ""),
+                status=getattr(args, "status", ""),
+            )
+            print(json.dumps([_serialize_audit_event(event) for event in events], indent=2))
+            return 0
+        runs = retention_backend.list_retention_runs(limit=getattr(args, "limit", 20))
+        print(json.dumps([_serialize_retention_run(run) for run in runs], indent=2))
         return 0
     if args.command == "migrate-sqlite":
         if config.backend != "neo4j":

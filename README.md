@@ -52,6 +52,15 @@ waggle-mcp doctor
 
 > **Windows users:** Run all commands with `python -X utf8` or set `PYTHONUTF8=1` to avoid `UnicodeEncodeError` from emoji in log output.
 
+## Enterprise Evaluation
+
+For self-hosted production review and security posture:
+
+- [Production deployment guide](docs/deployment/production.md)
+- [Security model](docs/security/security-model.md)
+- [Hardening checklist](docs/security/hardening-checklist.md)
+- [Reference](docs/reference.md)
+
 ---
 
 ## 60-Second Demo

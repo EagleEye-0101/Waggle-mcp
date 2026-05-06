@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -12,6 +14,7 @@ from starlette.testclient import TestClient
 import waggle
 from waggle.auth import hash_api_key, verify_api_key
 from waggle.config import AppConfig
+from waggle.errors import AuthenticationError
 from waggle.errors import RateLimitExceededError
 from waggle.graph import MemoryGraph
 from waggle.models import NodeType
@@ -94,6 +97,128 @@ def test_api_key_hashing_round_trip() -> None:
     assert hashed != "secret-token"
     assert verify_api_key("secret-token", hashed) is True
     assert verify_api_key("wrong-token", hashed) is False
+
+
+def test_api_key_record_tracks_prefix_and_last_used(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    created = graph.create_api_key("tenant-http", "http-test", created_by="ops@example.com")
+    assert created.record.prefix.startswith("sk_live_")
+    assert created.record.created_by == "ops@example.com"
+
+    authenticated = graph.authenticate_api_key(created.raw_api_key)
+
+    assert authenticated.prefix == created.record.prefix
+    assert authenticated.last_used_at is not None
+
+
+def test_expired_api_key_is_rejected(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    created = graph.create_api_key(
+        "tenant-http",
+        "expired-test",
+        expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+    )
+
+    with pytest.raises(AuthenticationError, match="expired"):
+        graph.authenticate_api_key(created.raw_api_key)
+
+
+def test_retention_policy_and_prune_delete_old_records(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.ensure_tenant("tenant-http", "Tenant HTTP")
+    tenant_graph = graph.for_tenant("tenant-http")
+    old_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    new_time = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+    old_node = tenant_graph.add_node(
+        label="Old decision",
+        content="Should be pruned",
+        node_type=NodeType.DECISION,
+    )
+    fresh_node = tenant_graph.add_node(
+        label="Fresh decision",
+        content="Should remain",
+        node_type=NodeType.DECISION,
+    )
+
+    with tenant_graph._lock, tenant_graph._connect() as connection:  # noqa: SLF001 - test helper
+        connection.execute(
+            "UPDATE nodes SET created_at = ?, updated_at = ? WHERE id = ?",
+            (old_time.isoformat(), old_time.isoformat(), old_node.node.id),
+        )
+        connection.execute(
+            "UPDATE nodes SET created_at = ?, updated_at = ? WHERE id = ?",
+            (new_time.isoformat(), new_time.isoformat(), fresh_node.node.id),
+        )
+        tenant_graph._store_transcript_record(  # noqa: SLF001 - test helper
+            connection,
+            agent_id="codex",
+            project="MCP",
+            session_id="session-old",
+            observed_at=old_time,
+            turn_index=0,
+            role="user",
+            transcript_text="Old transcript",
+            metadata={},
+            message_identity="old:0:user",
+        )
+        tenant_graph._store_transcript_record(  # noqa: SLF001 - test helper
+            connection,
+            agent_id="codex",
+            project="MCP",
+            session_id="session-new",
+            observed_at=new_time,
+            turn_index=0,
+            role="user",
+            transcript_text="Fresh transcript",
+            metadata={},
+            message_identity="new:0:user",
+        )
+
+    policy = tenant_graph.update_retention_policy(enabled=True, retention_days=30, prune_interval_hours=12)
+    assert policy.enabled is True
+    assert policy.retention_days == 30
+    assert policy.prune_interval_hours == 12
+
+    run = tenant_graph.prune_retention(now=datetime(2026, 5, 6, tzinfo=timezone.utc))
+
+    assert run.status == "completed"
+    assert run.deleted_nodes == 1
+    assert run.deleted_transcripts == 1
+
+    with tenant_graph._lock, tenant_graph._connect() as connection:  # noqa: SLF001 - test helper
+        rows = connection.execute("SELECT label FROM nodes ORDER BY label ASC").fetchall()
+    assert {row["label"] for row in rows} == {"Fresh decision"}
+
+    transcripts = tenant_graph.list_transcript_records()
+    assert [record.transcript_text for record in transcripts] == ["Fresh transcript"]
+
+    runs = tenant_graph.list_retention_runs(limit=5)
+    assert runs[0].run_id == run.run_id
+    prune_events = tenant_graph.list_audit_events(limit=5, event_type="retention.prune.completed")
+    assert prune_events[0].metadata["deleted_nodes"] == 1
+
+
+def test_node_write_and_export_emit_audit_events(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path, tenant_id="tenant-http")
+    created = graph.add_node(
+        label="Audit fact",
+        content="Track this write",
+        node_type=NodeType.FACT,
+        project="MCP",
+        session_id="session-1",
+    )
+
+    export_result = graph.export_graph_backup()
+    events = graph.list_audit_events(limit=10)
+    event_types = [event.event_type for event in events]
+
+    assert created.created is True
+    assert "graph.node.created" in event_types
+    assert "export.created" in event_types
+    export_events = [event for event in events if event.resource_id == export_result.output_path]
+    assert export_events[0].metadata["format"] == "backup"
 
 
 def test_app_config_disables_hybrid_rerank_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,6 +315,9 @@ def test_http_app_health_auth_and_metrics(tmp_path: Path) -> None:
         assert "waggle_http_requests_total" in metrics.text
         assert "waggle_ready" in metrics.text
 
+    audit_events = graph.for_tenant("tenant-http").list_audit_events(limit=10, event_type="api_key.used")
+    assert audit_events[0].api_key_id == created.record.api_key_id
+
 
 def test_http_app_rate_limit_and_payload_limit(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
@@ -219,6 +347,48 @@ def test_http_app_rate_limit_and_payload_limit(tmp_path: Path) -> None:
 
         assert first.status_code == 200
         assert second.status_code == 429
+
+
+def test_http_admin_endpoints_require_admin_scope_when_key_present(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    scoped_key = graph.create_api_key("tenant-http", "reader", scopes=["graph:read"])
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        denied = client.get(
+            "/api/admin/audit-events",
+            params={"tenant_id": "tenant-http"},
+            headers={"X-API-Key": scoped_key.raw_api_key},
+        )
+        assert denied.status_code == 403
+
+
+def test_mcp_write_requires_graph_write_scope(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    read_only_key = graph.create_api_key("tenant-http", "reader", scopes=["graph:read"])
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        denied = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "tools/call",
+                "params": {
+                    "name": "store_node",
+                    "arguments": {
+                        "label": "Scoped",
+                        "content": "Should fail without write scope",
+                        "node_type": "note",
+                    },
+                },
+            },
+            headers={"X-API-Key": read_only_key.raw_api_key, "accept": "application/json, text/event-stream"},
+        )
+        assert denied.status_code == 403
 
 
 def test_http_graph_editor_routes_and_crud(tmp_path: Path) -> None:
@@ -403,3 +573,95 @@ def test_http_graph_editor_routes_and_crud(tmp_path: Path) -> None:
 
         deleted_node = client.delete(f"/api/graph/nodes/{second_id}")
         assert deleted_node.status_code == 200
+
+    audit_events = graph.list_audit_events(limit=50)
+    event_types = {event.event_type for event in audit_events}
+    assert "graph.snapshot.read" in event_types
+    assert "record.read" in event_types
+    assert "graph.query.executed" in event_types
+    assert "graph.diff.read" in event_types
+    assert "export.downloaded" in event_types
+
+
+def test_http_admin_retention_and_audit_endpoints(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path, backend="sqlite", transport="http"))
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        update = client.put(
+            "/api/admin/retention",
+            json={
+                "tenant_id": "workspace-a",
+                "enabled": True,
+                "retention_days": 90,
+                "prune_interval_hours": 24,
+            },
+        )
+        assert update.status_code == 200
+        assert update.json()["enabled"] is True
+
+        status = client.get("/api/admin/retention", params={"tenant_id": "workspace-a"})
+        assert status.status_code == 200
+        assert status.json()["retention_days"] == 90
+
+        prune = client.post("/api/admin/retention/prune", json={"tenant_id": "workspace-a", "batch_size": 1000})
+        assert prune.status_code == 200
+        assert prune.json()["status"] in {"completed", "skipped"}
+
+        runs = client.get("/api/admin/retention/runs", params={"tenant_id": "workspace-a", "limit": 10})
+        assert runs.status_code == 200
+        assert runs.json()
+
+        audit = client.get("/api/admin/audit-events", params={"tenant_id": "workspace-a", "type": "retention.policy.updated"})
+        assert audit.status_code == 200
+        assert audit.json()[0]["event_type"] == "retention.policy.updated"
+
+
+def test_http_identity_provider_routes_require_plus(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        provider = client.get("/api/admin/identity/provider")
+        assert provider.status_code == 501
+        assert provider.json()["error"] == "plus_required"
+
+
+def test_http_identity_provider_routes_use_plus_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeIdentityProvider:
+        def status(self) -> dict[str, object]:
+            return {
+                "issuer": "https://id.example.com",
+                "client_id": "waggle-plus-client",
+                "supported_roles": ["Owner", "Admin", "Developer", "Viewer", "Auditor"],
+            }
+
+        def authorize_url(self, *, redirect_uri: str, state: str) -> str:
+            return f"https://id.example.com/authorize?redirect_uri={redirect_uri}&state={state}"
+
+    fake_plus = ModuleType("waggle_plus")
+    fake_plus.__version__ = "2.0.0"
+    fake_plus.WAGGLE_PLUS_CAPABILITIES = ("oidc_sso", "rbac")
+    fake_plus.build_identity_provider = lambda: FakeIdentityProvider()
+    monkeypatch.setitem(sys.modules, "waggle_plus", fake_plus)
+
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    app = create_http_application(app_server, app_server.config)
+
+    try:
+        with TestClient(app) as client:
+            provider = client.get("/api/admin/identity/provider")
+            assert provider.status_code == 200
+            assert provider.json()["provider"]["issuer"] == "https://id.example.com"
+
+            authorize = client.post(
+                "/api/admin/identity/authorize",
+                json={"redirect_uri": "https://waggle.example.com/callback", "state": "state-123"},
+            )
+            assert authorize.status_code == 200
+            assert "state=state-123" in authorize.json()["authorize_url"]
+    finally:
+        sys.modules.pop("waggle_plus", None)

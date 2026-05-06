@@ -93,6 +93,32 @@ def detect_plus(module_name: str | None = None) -> PlusStatus:
     )
 
 
+def load_plus_module(module_name: str | None = None) -> tuple[PlusStatus, Any | None]:
+    status = detect_plus(module_name)
+    if not status.installed:
+        return status, None
+    try:
+        return status, import_module(status.module_name)
+    except Exception:
+        return detect_plus(module_name), None
+
+
+def has_plus_capability(capability: str, module_name: str | None = None) -> bool:
+    status = detect_plus(module_name)
+    return status.installed and capability.strip() in status.capabilities
+
+
+def load_identity_provider(module_name: str | None = None) -> tuple[PlusStatus, Any | None]:
+    status, module = load_plus_module(module_name)
+    if module is None:
+        return status, None
+    provider_factory = getattr(module, "build_identity_provider", None)
+    if callable(provider_factory):
+        return status, provider_factory()
+    provider = getattr(module, "WAGGLE_PLUS_IDENTITY_PROVIDER", None)
+    return status, provider
+
+
 def _read_capabilities(module: Any) -> tuple[str, ...]:
     raw_capabilities = getattr(module, "WAGGLE_PLUS_CAPABILITIES", ())
     if raw_capabilities is None:

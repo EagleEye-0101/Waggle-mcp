@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from uuid import uuid4
@@ -37,7 +37,7 @@ from waggle.abhi import (
     validate_abhi_signature,
     write_abhi_document,
 )
-from waggle.auth import generate_api_key, hash_api_key, verify_api_key
+from waggle.auth import api_key_prefix, generate_api_key, hash_api_key, verify_api_key
 from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.embeddings import EmbeddingModel
 from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
@@ -88,6 +88,7 @@ from waggle.models import (
     AbhiValidationResult,
     ApiKeyCreateResult,
     ApiKeyRecord,
+    AuditEventRecord,
     BackupResult,
     ConflictEntry,
     ConflictListResult,
@@ -116,6 +117,8 @@ from waggle.models import (
     ReplayHit,
     RecentNodeStat,
     RelationType,
+    RetentionPolicyRecord,
+    RetentionPruneRunRecord,
     SubgraphResult,
     TranscriptIngestionInput,
     TranscriptIngestionResult,
@@ -289,10 +292,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     api_key_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     key_hash TEXT NOT NULL,
+    prefix TEXT DEFAULT '',
     name TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL,
+    expires_at TEXT DEFAULT NULL,
+    revoked_at TEXT DEFAULT NULL,
     last_used_at TEXT DEFAULT NULL,
+    created_by TEXT DEFAULT '',
+    scopes TEXT DEFAULT '["graph:read","graph:write","admin:read","admin:write"]',
     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
 );
 
@@ -417,6 +425,53 @@ CREATE TABLE IF NOT EXISTS graph_ui_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (tenant_id, agent_id, project, session_id)
 );
+
+CREATE TABLE IF NOT EXISTS retention_policy (
+    tenant_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    retention_days INTEGER NOT NULL DEFAULT 90,
+    prune_interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_pruned_at TEXT DEFAULT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS retention_prune_runs (
+    run_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cutoff TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT DEFAULT NULL,
+    deleted_nodes INTEGER NOT NULL DEFAULT 0,
+    deleted_edges INTEGER NOT NULL DEFAULT 0,
+    deleted_transcripts INTEGER NOT NULL DEFAULT 0,
+    deleted_context_windows INTEGER NOT NULL DEFAULT 0,
+    deleted_context_window_edges INTEGER NOT NULL DEFAULT 0,
+    deleted_exports INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT DEFAULT '',
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT 'system',
+    actor_id TEXT DEFAULT '',
+    api_key_id TEXT DEFAULT '',
+    resource_type TEXT DEFAULT '',
+    resource_id TEXT DEFAULT '',
+    action TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'success',
+    ip_address TEXT DEFAULT '',
+    user_agent TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}',
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+);
 """
 
 INDEX_SQL = """
@@ -444,6 +499,11 @@ CREATE INDEX IF NOT EXISTS idx_cw_edges_source ON context_window_edges(source_wi
 CREATE INDEX IF NOT EXISTS idx_cw_edges_target ON context_window_edges(target_window_id);
 CREATE INDEX IF NOT EXISTS idx_cw_edges_type ON context_window_edges(edge_type);
 CREATE INDEX IF NOT EXISTS idx_graph_ui_scope ON graph_ui_state(tenant_id, project, agent_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_retention_runs_tenant_started ON retention_prune_runs(tenant_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_created ON audit_events(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_type ON audit_events(tenant_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_actor ON audit_events(tenant_id, actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_resource ON audit_events(tenant_id, resource_id);
 """
 
 RELATION_WEIGHTS: dict[str, float] = {
@@ -874,29 +934,46 @@ class MemoryGraph:
             )
         return merged
 
-    def create_api_key(self, tenant_id: str, name: str = "") -> ApiKeyCreateResult:
+    def create_api_key(
+        self,
+        tenant_id: str,
+        name: str = "",
+        *,
+        expires_at: datetime | None = None,
+        created_by: str = "",
+        scopes: list[str] | None = None,
+    ) -> ApiKeyCreateResult:
         tenant = self.ensure_tenant(tenant_id)
         raw_api_key = generate_api_key()
         record = ApiKeyRecord(
             api_key_id=str(uuid4()),
             tenant_id=tenant.tenant_id,
             key_hash=hash_api_key(raw_api_key),
+            prefix=api_key_prefix(raw_api_key),
             name=name.strip(),
+            expires_at=expires_at,
+            created_by=created_by.strip(),
+            scopes=scopes,
         )
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO api_keys (api_key_id, tenant_id, key_hash, name, status, created_at, last_used_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO api_keys (api_key_id, tenant_id, key_hash, prefix, name, status, created_at, expires_at, revoked_at, last_used_at, created_by, scopes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.api_key_id,
                     record.tenant_id,
                     record.key_hash,
+                    record.prefix,
                     record.name,
                     record.status,
                     record.created_at.isoformat(),
+                    record.expires_at.isoformat() if record.expires_at else None,
                     None,
+                    None,
+                    record.created_by,
+                    json.dumps(record.scopes),
                 ),
             )
         return ApiKeyCreateResult(record=record, raw_api_key=raw_api_key)
@@ -905,7 +982,7 @@ class MemoryGraph:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT api_key_id, tenant_id, key_hash, name, status, created_at, last_used_at
+                SELECT api_key_id, tenant_id, key_hash, prefix, name, status, created_at, expires_at, revoked_at, last_used_at, created_by, scopes
                 FROM api_keys
                 WHERE tenant_id = ?
                 ORDER BY created_at DESC
@@ -917,10 +994,15 @@ class MemoryGraph:
                 api_key_id=row["api_key_id"],
                 tenant_id=row["tenant_id"],
                 key_hash=row["key_hash"],
+                prefix=row["prefix"] or "",
                 name=row["name"] or "",
                 status=row["status"],
                 created_at=_parse_datetime(row["created_at"]),
+                expires_at=_parse_datetime(row["expires_at"]) if row["expires_at"] else None,
+                revoked_at=_parse_datetime(row["revoked_at"]) if row["revoked_at"] else None,
                 last_used_at=_parse_datetime(row["last_used_at"]) if row["last_used_at"] else None,
+                created_by=row["created_by"] or "",
+                scopes=json.loads(row["scopes"] or "[]"),
             )
             for row in rows
         ]
@@ -928,16 +1010,275 @@ class MemoryGraph:
     def revoke_api_key(self, api_key_id: str) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "UPDATE api_keys SET status = 'revoked' WHERE api_key_id = ?",
-                (api_key_id,),
+                "UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE api_key_id = ?",
+                (utc_now().isoformat(), api_key_id),
             )
+
+    def get_retention_policy(
+        self,
+        *,
+        default_enabled: bool = False,
+        default_retention_days: int = 90,
+        default_prune_interval_hours: int = 24,
+    ) -> RetentionPolicyRecord:
+        now = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO retention_policy (
+                    tenant_id, enabled, retention_days, prune_interval_hours, last_pruned_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(tenant_id) DO NOTHING
+                """,
+                (
+                    self.tenant_id,
+                    1 if default_enabled else 0,
+                    int(default_retention_days),
+                    int(default_prune_interval_hours),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT tenant_id, enabled, retention_days, prune_interval_hours, last_pruned_at, created_at, updated_at
+                FROM retention_policy
+                WHERE tenant_id = ?
+                """,
+                (self.tenant_id,),
+            ).fetchone()
+        return RetentionPolicyRecord(
+            tenant_id=row["tenant_id"],
+            enabled=bool(row["enabled"]),
+            retention_days=int(row["retention_days"]),
+            prune_interval_hours=int(row["prune_interval_hours"]),
+            last_pruned_at=_parse_datetime(row["last_pruned_at"]) if row["last_pruned_at"] else None,
+            created_at=_parse_datetime(row["created_at"]),
+            updated_at=_parse_datetime(row["updated_at"]),
+        )
+
+    def update_retention_policy(
+        self,
+        *,
+        enabled: bool | None = None,
+        retention_days: int | None = None,
+        prune_interval_hours: int | None = None,
+        default_enabled: bool = False,
+        default_retention_days: int = 90,
+        default_prune_interval_hours: int = 24,
+    ) -> RetentionPolicyRecord:
+        current = self.get_retention_policy(
+            default_enabled=default_enabled,
+            default_retention_days=default_retention_days,
+            default_prune_interval_hours=default_prune_interval_hours,
+        )
+        next_enabled = current.enabled if enabled is None else bool(enabled)
+        next_retention_days = current.retention_days if retention_days is None else int(retention_days)
+        next_prune_interval_hours = current.prune_interval_hours if prune_interval_hours is None else int(prune_interval_hours)
+        if next_retention_days < 1:
+            raise ValidationFailure("Retention days must be at least 1.")
+        if next_prune_interval_hours < 1:
+            raise ValidationFailure("Prune interval hours must be at least 1.")
+        updated_at = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE retention_policy
+                SET enabled = ?, retention_days = ?, prune_interval_hours = ?, updated_at = ?
+                WHERE tenant_id = ?
+                """,
+                (
+                    1 if next_enabled else 0,
+                    next_retention_days,
+                    next_prune_interval_hours,
+                    updated_at.isoformat(),
+                    self.tenant_id,
+                ),
+            )
+        return self.get_retention_policy(
+            default_enabled=default_enabled,
+            default_retention_days=default_retention_days,
+            default_prune_interval_hours=default_prune_interval_hours,
+        )
+
+    def list_retention_runs(self, *, limit: int = 20) -> list[RetentionPruneRunRecord]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id, tenant_id, status, cutoff, started_at, completed_at,
+                       deleted_nodes, deleted_edges, deleted_transcripts, deleted_context_windows,
+                       deleted_context_window_edges, deleted_exports, duration_ms, error_message
+                FROM retention_prune_runs
+                WHERE tenant_id = ?
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (self.tenant_id, max(1, int(limit))),
+            ).fetchall()
+        return [
+            RetentionPruneRunRecord(
+                run_id=row["run_id"],
+                tenant_id=row["tenant_id"],
+                status=row["status"],
+                cutoff=_parse_datetime(row["cutoff"]),
+                started_at=_parse_datetime(row["started_at"]),
+                completed_at=_parse_datetime(row["completed_at"]) if row["completed_at"] else None,
+                deleted_nodes=int(row["deleted_nodes"] or 0),
+                deleted_edges=int(row["deleted_edges"] or 0),
+                deleted_transcripts=int(row["deleted_transcripts"] or 0),
+                deleted_context_windows=int(row["deleted_context_windows"] or 0),
+                deleted_context_window_edges=int(row["deleted_context_window_edges"] or 0),
+                deleted_exports=int(row["deleted_exports"] or 0),
+                duration_ms=int(row["duration_ms"] or 0),
+                error_message=row["error_message"] or "",
+            )
+            for row in rows
+        ]
+
+    def prune_retention(
+        self,
+        *,
+        now: datetime | None = None,
+        batch_size: int = 1000,
+        default_enabled: bool = False,
+        default_retention_days: int = 90,
+        default_prune_interval_hours: int = 24,
+    ) -> RetentionPruneRunRecord:
+        policy = self.get_retention_policy(
+            default_enabled=default_enabled,
+            default_retention_days=default_retention_days,
+            default_prune_interval_hours=default_prune_interval_hours,
+        )
+        current_time = now or utc_now()
+        cutoff = current_time - timedelta(days=policy.retention_days)
+        started_at = utc_now()
+        run = RetentionPruneRunRecord(
+            tenant_id=self.tenant_id,
+            status="completed",
+            cutoff=cutoff,
+            started_at=started_at,
+        )
+        if not policy.enabled:
+            run.status = "skipped"
+            run.completed_at = started_at
+            run.duration_ms = 0
+            self._store_retention_run(run)
+            return run
+
+        batch_limit = max(1, int(batch_size))
+        try:
+            with self._lock, self._connect() as connection:
+                run.deleted_context_window_edges = self._prune_table_by_ids(
+                    connection,
+                    select_sql="""
+                        SELECT id FROM context_window_edges
+                        WHERE tenant_id = ? AND created_at < ?
+                        LIMIT ?
+                    """,
+                    delete_sql="DELETE FROM context_window_edges WHERE id IN ({placeholders})",
+                    params=(self.tenant_id, cutoff.isoformat()),
+                    batch_limit=batch_limit,
+                )
+                run.deleted_edges = self._prune_table_by_ids(
+                    connection,
+                    select_sql="""
+                        SELECT id FROM edges
+                        WHERE tenant_id = ? AND created_at < ?
+                        LIMIT ?
+                    """,
+                    delete_sql="DELETE FROM edges WHERE id IN ({placeholders})",
+                    params=(self.tenant_id, cutoff.isoformat()),
+                    batch_limit=batch_limit,
+                )
+                run.deleted_nodes = self._prune_table_by_ids(
+                    connection,
+                    select_sql="""
+                        SELECT id FROM nodes
+                        WHERE tenant_id = ? AND created_at < ?
+                        LIMIT ?
+                    """,
+                    delete_sql="DELETE FROM nodes WHERE id IN ({placeholders})",
+                    params=(self.tenant_id, cutoff.isoformat()),
+                    batch_limit=batch_limit,
+                )
+                run.deleted_transcripts = self._prune_table_by_ids(
+                    connection,
+                    select_sql="""
+                        SELECT id FROM transcript_records
+                        WHERE tenant_id = ? AND observed_at < ?
+                        LIMIT ?
+                    """,
+                    delete_sql="DELETE FROM transcript_records WHERE id IN ({placeholders})",
+                    params=(self.tenant_id, cutoff.isoformat()),
+                    batch_limit=batch_limit,
+                )
+                run.deleted_context_windows = self._prune_table_by_ids(
+                    connection,
+                    select_sql="""
+                        SELECT id FROM context_windows
+                        WHERE tenant_id = ? AND created_at < ?
+                        LIMIT ?
+                    """,
+                    delete_sql="DELETE FROM context_windows WHERE id IN ({placeholders})",
+                    params=(self.tenant_id, cutoff.isoformat()),
+                    batch_limit=batch_limit,
+                )
+                run.deleted_exports = self._delete_old_export_files(cutoff=cutoff)
+                completed_at = utc_now()
+                run.completed_at = completed_at
+                run.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))
+                connection.execute(
+                    """
+                    UPDATE retention_policy
+                    SET last_pruned_at = ?, updated_at = ?
+                    WHERE tenant_id = ?
+                    """,
+                    (completed_at.isoformat(), completed_at.isoformat(), self.tenant_id),
+                )
+                self._store_retention_run(run, connection=connection)
+                self.emit_audit_event(
+                    event_type="retention.prune.completed",
+                    resource_type="retention_policy",
+                    resource_id=self.tenant_id,
+                    action="prune",
+                    metadata={
+                        "run_id": run.run_id,
+                        "cutoff": run.cutoff.isoformat(),
+                        "deleted_nodes": run.deleted_nodes,
+                        "deleted_edges": run.deleted_edges,
+                        "deleted_transcripts": run.deleted_transcripts,
+                        "deleted_context_windows": run.deleted_context_windows,
+                        "deleted_context_window_edges": run.deleted_context_window_edges,
+                        "deleted_exports": run.deleted_exports,
+                        "duration_ms": run.duration_ms,
+                    },
+                    connection=connection,
+                )
+        except Exception as exc:
+            completed_at = utc_now()
+            run.status = "failed"
+            run.error_message = str(exc)
+            run.completed_at = completed_at
+            run.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))
+            self._store_retention_run(run)
+            self.emit_audit_event(
+                event_type="retention.prune.failed",
+                resource_type="retention_policy",
+                resource_id=self.tenant_id,
+                action="prune",
+                status="failed",
+                metadata={"run_id": run.run_id, "cutoff": run.cutoff.isoformat(), "error_message": run.error_message},
+            )
+            raise
+        return run
 
     def authenticate_api_key(self, raw_api_key: str) -> ApiKeyRecord:
         key_hash = hash_api_key(raw_api_key)
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT api_key_id, tenant_id, key_hash, name, status, created_at, last_used_at
+                SELECT api_key_id, tenant_id, key_hash, prefix, name, status, created_at, expires_at, revoked_at, last_used_at, created_by, scopes
                 FROM api_keys
                 WHERE key_hash = ?
                 LIMIT 1
@@ -946,6 +1287,11 @@ class MemoryGraph:
             ).fetchone()
             if row is None or not verify_api_key(raw_api_key, row["key_hash"]):
                 raise AuthenticationError("Invalid API key.")
+            if row["status"] != "active":
+                raise AuthenticationError("Invalid API key.")
+            expires_at = _parse_datetime(row["expires_at"]) if row["expires_at"] else None
+            if expires_at is not None and expires_at <= utc_now():
+                raise AuthenticationError("API key expired.")
             connection.execute(
                 "UPDATE api_keys SET last_used_at = ? WHERE api_key_id = ?",
                 (utc_now().isoformat(), row["api_key_id"]),
@@ -954,15 +1300,34 @@ class MemoryGraph:
             api_key_id=row["api_key_id"],
             tenant_id=row["tenant_id"],
             key_hash=row["key_hash"],
+            prefix=row["prefix"] or "",
             name=row["name"] or "",
             status=row["status"],
             created_at=_parse_datetime(row["created_at"]),
+            expires_at=expires_at,
+            revoked_at=_parse_datetime(row["revoked_at"]) if row["revoked_at"] else None,
             last_used_at=utc_now(),
+            created_by=row["created_by"] or "",
+            scopes=json.loads(row["scopes"] or "[]"),
         )
 
     def _migrate_legacy_schema(self, connection: sqlite3.Connection) -> None:
+        api_key_columns = {row["name"] for row in connection.execute("PRAGMA table_info(api_keys)").fetchall()}
         node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()}
         edge_columns = {row["name"] for row in connection.execute("PRAGMA table_info(edges)").fetchall()}
+        if "prefix" not in api_key_columns:
+            connection.execute("ALTER TABLE api_keys ADD COLUMN prefix TEXT DEFAULT ''")
+            connection.execute("UPDATE api_keys SET prefix = substr(key_hash, 1, 16) WHERE prefix = ''")
+        if "expires_at" not in api_key_columns:
+            connection.execute("ALTER TABLE api_keys ADD COLUMN expires_at TEXT DEFAULT NULL")
+        if "revoked_at" not in api_key_columns:
+            connection.execute("ALTER TABLE api_keys ADD COLUMN revoked_at TEXT DEFAULT NULL")
+        if "created_by" not in api_key_columns:
+            connection.execute("ALTER TABLE api_keys ADD COLUMN created_by TEXT DEFAULT ''")
+        if "scopes" not in api_key_columns:
+            connection.execute(
+                """ALTER TABLE api_keys ADD COLUMN scopes TEXT DEFAULT '["graph:read","graph:write","admin:read","admin:write"]'"""
+            )
         if "tenant_id" not in node_columns:
             connection.execute(
                 f"ALTER TABLE nodes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
@@ -1058,6 +1423,209 @@ class MemoryGraph:
             """,
             (SCHEMA_VERSION, utc_now().isoformat()),
         )
+
+    def _prune_table_by_ids(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        select_sql: str,
+        delete_sql: str,
+        params: tuple[Any, ...],
+        batch_limit: int,
+    ) -> int:
+        deleted = 0
+        while True:
+            rows = connection.execute(select_sql, (*params, batch_limit)).fetchall()
+            if not rows:
+                return deleted
+            ids = [row["id"] for row in rows]
+            placeholders = ", ".join("?" for _ in ids)
+            connection.execute(delete_sql.format(placeholders=placeholders), ids)
+            deleted += len(ids)
+
+    def _delete_old_export_files(self, *, cutoff: datetime) -> int:
+        if not self.export_dir.exists():
+            return 0
+        deleted = 0
+        cutoff_ts = cutoff.timestamp()
+        for path in self.export_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff_ts:
+                    path.unlink(missing_ok=True)
+                    deleted += 1
+            except FileNotFoundError:
+                continue
+        return deleted
+
+    def _store_retention_run(
+        self,
+        run: RetentionPruneRunRecord,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        owns_connection = connection is None
+        active_connection = connection
+        if active_connection is None:
+            active_connection = self._connect()
+        try:
+            active_connection.execute(
+                """
+                INSERT OR REPLACE INTO retention_prune_runs (
+                    run_id, tenant_id, status, cutoff, started_at, completed_at,
+                    deleted_nodes, deleted_edges, deleted_transcripts, deleted_context_windows,
+                    deleted_context_window_edges, deleted_exports, duration_ms, error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.run_id,
+                    run.tenant_id,
+                    run.status,
+                    run.cutoff.isoformat(),
+                    run.started_at.isoformat(),
+                    run.completed_at.isoformat() if run.completed_at else None,
+                    run.deleted_nodes,
+                    run.deleted_edges,
+                    run.deleted_transcripts,
+                    run.deleted_context_windows,
+                    run.deleted_context_window_edges,
+                    run.deleted_exports,
+                    run.duration_ms,
+                    run.error_message,
+                ),
+            )
+        finally:
+            if owns_connection and active_connection is not None:
+                active_connection.commit()
+                active_connection.close()
+
+    def emit_audit_event(
+        self,
+        *,
+        event_type: str,
+        actor_type: str = "system",
+        actor_id: str = "",
+        api_key_id: str = "",
+        resource_type: str = "",
+        resource_id: str = "",
+        action: str = "",
+        status: str = "success",
+        ip_address: str = "",
+        user_agent: str = "",
+        metadata: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> AuditEventRecord:
+        event = AuditEventRecord(
+            tenant_id=self.tenant_id,
+            event_type=event_type,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            api_key_id=api_key_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            action=action or event_type,
+            status=status,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            created_at=created_at or utc_now(),
+            metadata=metadata or {},
+        )
+        owns_connection = connection is None
+        active_connection = connection or self._connect()
+        try:
+            active_connection.execute(
+                """
+                INSERT INTO audit_events (
+                    event_id, tenant_id, event_type, actor_type, actor_id, api_key_id,
+                    resource_type, resource_id, action, status, ip_address, user_agent,
+                    created_at, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.tenant_id,
+                    event.event_type,
+                    event.actor_type,
+                    event.actor_id,
+                    event.api_key_id,
+                    event.resource_type,
+                    event.resource_id,
+                    event.action,
+                    event.status,
+                    event.ip_address,
+                    event.user_agent,
+                    event.created_at.isoformat(),
+                    json.dumps(event.metadata),
+                ),
+            )
+        finally:
+            if owns_connection:
+                active_connection.commit()
+                active_connection.close()
+        return event
+
+    def list_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        event_type: str = "",
+        actor_id: str = "",
+        resource_id: str = "",
+        resource_type: str = "",
+        status: str = "",
+    ) -> list[AuditEventRecord]:
+        predicates = ["tenant_id = ?"]
+        values: list[Any] = [self.tenant_id]
+        if event_type.strip():
+            predicates.append("event_type = ?")
+            values.append(event_type.strip())
+        if actor_id.strip():
+            predicates.append("actor_id = ?")
+            values.append(actor_id.strip())
+        if resource_id.strip():
+            predicates.append("resource_id = ?")
+            values.append(resource_id.strip())
+        if resource_type.strip():
+            predicates.append("resource_type = ?")
+            values.append(resource_type.strip())
+        if status.strip():
+            predicates.append("status = ?")
+            values.append(status.strip())
+        query = f"""
+            SELECT event_id, tenant_id, event_type, actor_type, actor_id, api_key_id,
+                   resource_type, resource_id, action, status, ip_address, user_agent,
+                   created_at, metadata
+            FROM audit_events
+            WHERE {" AND ".join(predicates)}
+            ORDER BY created_at DESC
+            LIMIT ?
+        """
+        values.append(max(1, int(limit)))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, tuple(values)).fetchall()
+        return [
+            AuditEventRecord(
+                event_id=row["event_id"],
+                tenant_id=row["tenant_id"],
+                event_type=row["event_type"],
+                actor_type=row["actor_type"] or "system",
+                actor_id=row["actor_id"] or "",
+                api_key_id=row["api_key_id"] or "",
+                resource_type=row["resource_type"] or "",
+                resource_id=row["resource_id"] or "",
+                action=row["action"] or "",
+                status=row["status"] or "success",
+                ip_address=row["ip_address"] or "",
+                user_agent=row["user_agent"] or "",
+                created_at=_parse_datetime(row["created_at"]),
+                metadata=_decode_metadata(row["metadata"]),
+            )
+            for row in rows
+        ]
 
     def _current_embedding_model_id(self) -> str:
         model_id = getattr(self.embedding_model, "model_id", "").strip()
@@ -1879,6 +2447,18 @@ class MemoryGraph:
                             (merged_node.context_window_id, self.tenant_id, merged_node.id),
                         )
                         self._mark_window_embedding_stale(active_connection, merged_node.context_window_id)
+                    self.emit_audit_event(
+                        event_type="graph.node.updated",
+                        resource_type="node",
+                        resource_id=merged_node.id,
+                        action="update",
+                        metadata={
+                            "reason": "dedup_merge",
+                            "dedup_reason": dedup_reason,
+                            "similarity": similarity,
+                        },
+                        connection=active_connection,
+                    )
                     return NodeStoreResult(
                         node=merged_node,
                         created=False,
@@ -1925,6 +2505,18 @@ class MemoryGraph:
             self._mark_window_embedding_stale(active_connection, resolved_context_window_id)
             self._update_window_node_count(active_connection, resolved_context_window_id)
             conflicts = self._register_conflicts(active_connection, node) if self.enable_dedup else []
+            self.emit_audit_event(
+                event_type="graph.node.created",
+                resource_type="node",
+                resource_id=node.id,
+                action="create",
+                metadata={
+                    "node_type": node.node_type.value,
+                    "project": node.project,
+                    "session_id": node.session_id,
+                },
+                connection=active_connection,
+            )
             return NodeStoreResult(node=node, created=True, conflicts=conflicts)
 
         if connection is not None:
@@ -3409,6 +4001,14 @@ class MemoryGraph:
                     self.tenant_id,
                 ),
             )
+            self.emit_audit_event(
+                event_type="graph.node.updated",
+                resource_type="node",
+                resource_id=updated_node.id,
+                action="update",
+                metadata={"project": updated_node.project, "session_id": updated_node.session_id},
+                connection=connection,
+            )
             return updated_node
 
     def update_edge(
@@ -3463,6 +4063,14 @@ class MemoryGraph:
                     self.tenant_id,
                 ),
             )
+            self.emit_audit_event(
+                event_type="graph.relationship.updated",
+                resource_type="edge",
+                resource_id=updated_edge.id,
+                action="update",
+                metadata={"relationship": updated_edge.relationship},
+                connection=connection,
+            )
             return updated_edge
 
     def delete_edge(self, *, edge_id: str) -> Edge:
@@ -3472,6 +4080,14 @@ class MemoryGraph:
                 raise ValueError(f"Edge not found: {edge_id}")
             edge = self._row_to_edge(row)
             connection.execute("DELETE FROM edges WHERE id = ? AND tenant_id = ?", (edge_id, self.tenant_id))
+            self.emit_audit_event(
+                event_type="graph.relationship.deleted",
+                resource_type="edge",
+                resource_id=edge.id,
+                action="delete",
+                metadata={"relationship": edge.relationship},
+                connection=connection,
+            )
             return edge
 
     def delete_node(self, *, node_id: str) -> Node:
@@ -3481,6 +4097,14 @@ class MemoryGraph:
                 raise ValueError(f"Node not found: {node_id}")
             node = self._row_to_node(row)
             connection.execute("DELETE FROM nodes WHERE id = ? AND tenant_id = ?", (node_id, self.tenant_id))
+            self.emit_audit_event(
+                event_type="graph.node.deleted",
+                resource_type="node",
+                resource_id=node.id,
+                action="delete",
+                metadata={"node_type": node.node_type.value, "project": node.project, "session_id": node.session_id},
+                connection=connection,
+            )
             return node
 
     def list_recent_nodes(
@@ -3923,13 +4547,21 @@ class MemoryGraph:
             destination.parent.mkdir(parents=True, exist_ok=True)
 
         destination.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-        return BackupResult(
+        result = BackupResult(
             output_path=str(destination),
             tenant_id=self.tenant_id,
             schema_version=SCHEMA_VERSION,
             node_count=len(snapshot["nodes"]),
             edge_count=len(snapshot["edges"]),
         )
+        self.emit_audit_event(
+            event_type="export.created",
+            resource_type="backup",
+            resource_id=result.output_path,
+            action="export",
+            metadata={"format": "backup", "node_count": result.node_count, "edge_count": result.edge_count},
+        )
+        return result
 
     def export_abhi(
         self,
@@ -3957,7 +4589,7 @@ class MemoryGraph:
             destination = self.export_dir / f"waggle-memory-{timestamp}.abhi"
         else:
             destination = Path(output_path).expanduser()
-        return write_abhi_document(
+        result = write_abhi_document(
             snapshot,
             output_path=destination,
             passphrase=passphrase,
@@ -3973,6 +4605,19 @@ class MemoryGraph:
             include_low_confidence_edges=include_low_confidence_edges,
             low_confidence_threshold=low_confidence_threshold,
         )
+        self.emit_audit_event(
+            event_type="export.created",
+            resource_type="abhi_export",
+            resource_id=result.output_path,
+            action="export",
+            metadata={
+                "format": "abhi",
+                "node_count": result.node_count,
+                "edge_count": result.edge_count,
+                "encrypted": result.encrypted,
+            },
+        )
+        return result
 
     def get_graph_snapshot(
         self,
@@ -4100,7 +4745,7 @@ class MemoryGraph:
             replay_hits=replay_hits,
             stats=self.get_stats(),
         )
-        return export_context_bundle_files(
+        result = export_context_bundle_files(
             bundle,
             output_path=output_path,
             export_dir=self.export_dir,
@@ -4109,6 +4754,19 @@ class MemoryGraph:
             include_timestamps=include_timestamps,
             include_source_prompt=include_source_prompt,
         )
+        self.emit_audit_event(
+            event_type="export.created",
+            resource_type="context_bundle",
+            resource_id=result.markdown_path or result.json_path or "",
+            action="export",
+            metadata={
+                "format": normalized_format,
+                "mode": normalized_mode,
+                "node_count": result.node_count,
+                "edge_count": result.edge_count,
+            },
+        )
+        return result
 
     def export_markdown_vault(
         self,
@@ -4331,6 +4989,19 @@ class MemoryGraph:
             collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
             selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
         )
+        self.emit_audit_event(
+            event_type="import.completed",
+            resource_type="backup",
+            resource_id=str(source),
+            action="import",
+            metadata={
+                "format": "backup",
+                "nodes_created": result.nodes_created,
+                "nodes_updated": result.nodes_updated,
+                "edges_created": result.edges_created,
+                "edges_updated": result.edges_updated,
+            },
+        )
         return result
 
     def validate_abhi(self, *, input_path: str | Path, passphrase: str = "") -> AbhiValidationResult:
@@ -4477,6 +5148,20 @@ class MemoryGraph:
             groups=snapshot.get("ui", {}).get("groups", []),
             collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
             selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
+        )
+        self.emit_audit_event(
+            event_type="import.completed",
+            resource_type="abhi_import",
+            resource_id=str(source),
+            action="import",
+            metadata={
+                "format": "abhi",
+                "nodes_created": result.nodes_created,
+                "nodes_updated": result.nodes_updated,
+                "edges_created": result.edges_created,
+                "edges_updated": result.edges_updated,
+                "encrypted": result.encrypted,
+            },
         )
         return result
 
@@ -6599,6 +7284,14 @@ class MemoryGraph:
                 _encode_metadata(edge.metadata),
                 edge.created_at.isoformat(),
             ),
+        )
+        self.emit_audit_event(
+            event_type="graph.relationship.created",
+            resource_type="edge",
+            resource_id=edge.id,
+            action="create",
+            metadata={"relationship": edge.relationship},
+            connection=connection,
         )
         return edge
 

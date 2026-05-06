@@ -124,6 +124,11 @@ def test_parser_accepts_graph_editor_commands() -> None:
     parser = _build_parser()
 
     plus_args = parser.parse_args(["plus", "--json"])
+    create_api_key_args = parser.parse_args(["create-api-key", "--tenant-id", "workspace-a", "--name", "prod-agent", "--expires-in-days", "30", "--created-by", "ops@example.com", "--scopes", "graph:read,admin:read"])
+    list_audit_args = parser.parse_args(["list-audit-events", "--tenant-id", "workspace-a", "--type", "api_key.created", "--limit", "25"])
+    retention_status_args = parser.parse_args(["retention-status", "--tenant-id", "workspace-a"])
+    set_retention_args = parser.parse_args(["set-retention", "--tenant-id", "workspace-a", "--enabled", "--days", "90", "--interval-hours", "12"])
+    prune_retention_args = parser.parse_args(["prune-retention", "--tenant-id", "workspace-a", "--batch-size", "250"])
     edit_args = parser.parse_args(["edit-graph", "--port", "8787", "--no-open"])
     view_args = parser.parse_args(["view-graph"])
     diff_args = parser.parse_args(["diff", "--file-a", "a.abhi", "--file-b", "b.abhi"])
@@ -153,6 +158,21 @@ def test_parser_accepts_graph_editor_commands() -> None:
 
     assert plus_args.command == "plus"
     assert plus_args.json is True
+    assert create_api_key_args.command == "create-api-key"
+    assert create_api_key_args.expires_in_days == 30
+    assert create_api_key_args.created_by == "ops@example.com"
+    assert create_api_key_args.scopes == "graph:read,admin:read"
+    assert list_audit_args.command == "list-audit-events"
+    assert list_audit_args.event_type == "api_key.created"
+    assert list_audit_args.limit == 25
+    assert retention_status_args.command == "retention-status"
+    assert retention_status_args.tenant_id == "workspace-a"
+    assert set_retention_args.command == "set-retention"
+    assert set_retention_args.enabled is True
+    assert set_retention_args.days == 90
+    assert set_retention_args.interval_hours == 12
+    assert prune_retention_args.command == "prune-retention"
+    assert prune_retention_args.batch_size == 250
     assert edit_args.command == "edit-graph"
     assert edit_args.port == 8787
     assert edit_args.open is False
@@ -322,6 +342,115 @@ def test_plus_command_reports_detected_module(
     assert "Installed: yes" in stdout
     assert "Version: 1.2.3" in stdout
     assert "advanced_context, contradiction_intelligence" in stdout
+
+
+def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+
+    create_args = SimpleNamespace(
+        command="create-api-key",
+        tenant_id="workspace-a",
+        name="prod-agent",
+        expires_in_days=30,
+        created_by="ops@example.com",
+    )
+    exit_code = _run_admin_command(app.config, create_args)
+    create_payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert create_payload["prefix"].startswith("sk_live_")
+    assert create_payload["created_by"] == "ops@example.com"
+    assert create_payload["scopes"] == ["graph:read", "graph:write", "admin:read", "admin:write"]
+    assert "raw_api_key" in create_payload
+    assert "key_hash" not in create_payload
+
+    list_args = SimpleNamespace(command="list-api-keys", tenant_id="workspace-a")
+    exit_code = _run_admin_command(app.config, list_args)
+    listed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert listed[0]["prefix"] == create_payload["prefix"]
+    assert listed[0]["created_by"] == "ops@example.com"
+    assert listed[0]["expires_at"] is not None
+    assert listed[0]["scopes"] == ["graph:read", "graph:write", "admin:read", "admin:write"]
+    assert "key_hash" not in listed[0]
+
+
+def test_retention_admin_commands_update_and_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+    tenant_graph = app.graph.for_tenant("workspace-a")
+    old_time = "2026-01-01T00:00:00+00:00"
+    tenant_graph.add_node(label="Old fact", content="prune me", node_type=NodeType.FACT)
+    with tenant_graph._lock, tenant_graph._connect() as connection:  # noqa: SLF001 - test helper
+        connection.execute("UPDATE nodes SET created_at = ?, updated_at = ?", (old_time, old_time))
+
+    set_args = SimpleNamespace(
+        command="set-retention",
+        tenant_id="workspace-a",
+        enabled=True,
+        days=30,
+        interval_hours=24,
+    )
+    exit_code = _run_admin_command(app.config, set_args)
+    policy = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert policy["enabled"] is True
+    assert policy["retention_days"] == 30
+
+    prune_args = SimpleNamespace(
+        command="prune-retention",
+        tenant_id="workspace-a",
+        batch_size=1000,
+    )
+    exit_code = _run_admin_command(app.config, prune_args)
+    prune_payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert prune_payload["status"] == "completed"
+    assert prune_payload["deleted_nodes"] == 1
+    assert prune_payload["policy"]["last_pruned_at"] is not None
+
+    status_args = SimpleNamespace(command="retention-status", tenant_id="workspace-a")
+    exit_code = _run_admin_command(app.config, status_args)
+    status_payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert status_payload["enabled"] is True
+    assert status_payload["recent_runs"][0]["status"] == "completed"
+
+
+def test_audit_events_are_queryable_from_admin_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+
+    create_args = SimpleNamespace(
+        command="create-api-key",
+        tenant_id="workspace-a",
+        name="prod-agent",
+        expires_in_days=30,
+        created_by="ops@example.com",
+    )
+    exit_code = _run_admin_command(app.config, create_args)
+    assert exit_code == 0
+    create_payload = json.loads(capsys.readouterr().out)
+
+    audit_args = SimpleNamespace(
+        command="list-audit-events",
+        tenant_id="workspace-a",
+        limit=20,
+        event_type="api_key.created",
+        actor_id="",
+        resource_id=create_payload["api_key_id"],
+        resource_type="api_key",
+        status="",
+    )
+    exit_code = _run_admin_command(app.config, audit_args)
+    events = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert events[0]["event_type"] == "api_key.created"
+    assert events[0]["resource_id"] == create_payload["api_key_id"]
+    assert events[0]["metadata"]["prefix"] == create_payload["prefix"]
 
 
 def test_run_admin_command_benchmark_oolong(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

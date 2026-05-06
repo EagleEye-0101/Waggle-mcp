@@ -8,10 +8,16 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from waggle.errors import AuthorizationError
+
 
 def utc_now() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc)
+
+
+def default_api_key_scopes() -> list[str]:
+    return ["graph:read", "graph:write", "admin:read", "admin:write"]
 
 
 class NodeType(str, Enum):
@@ -624,15 +630,86 @@ class ApiKeyRecord(BaseModel):
     api_key_id: str
     tenant_id: str
     key_hash: str
+    prefix: str = ""
     name: str = ""
     status: str = "active"
     created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
     last_used_at: datetime | None = None
+    created_by: str = ""
+    scopes: list[str] = Field(default_factory=default_api_key_scopes)
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value: Any) -> list[str]:
+        if value is None:
+            return default_api_key_scopes()
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",")]
+        else:
+            items = [str(item).strip() for item in value]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not item or item in seen:
+                continue
+            normalized.append(item)
+            seen.add(item)
+        return normalized or default_api_key_scopes()
+
+    def require_scope(self, scope: str) -> None:
+        if scope not in self.scopes:
+            raise AuthorizationError(f"API key is missing required scope: {scope}")
 
 
 class ApiKeyCreateResult(BaseModel):
     record: ApiKeyRecord
     raw_api_key: str
+
+
+class RetentionPolicyRecord(BaseModel):
+    tenant_id: str
+    enabled: bool = False
+    retention_days: int = 90
+    prune_interval_hours: int = 24
+    last_pruned_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class RetentionPruneRunRecord(BaseModel):
+    run_id: str = Field(default_factory=lambda: str(uuid4()))
+    tenant_id: str
+    status: str = "completed"
+    cutoff: datetime
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+    deleted_nodes: int = 0
+    deleted_edges: int = 0
+    deleted_transcripts: int = 0
+    deleted_context_windows: int = 0
+    deleted_context_window_edges: int = 0
+    deleted_exports: int = 0
+    duration_ms: int = 0
+    error_message: str = ""
+
+
+class AuditEventRecord(BaseModel):
+    event_id: str = Field(default_factory=lambda: str(uuid4()))
+    tenant_id: str
+    event_type: str
+    actor_type: str = "system"
+    actor_id: str = ""
+    api_key_id: str = ""
+    resource_type: str = ""
+    resource_id: str = ""
+    action: str = ""
+    status: str = "success"
+    ip_address: str = ""
+    user_agent: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TranscriptRecord(BaseModel):
