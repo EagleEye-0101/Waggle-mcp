@@ -356,7 +356,7 @@ export function buildLayerGraph({ graph, transcriptPairs, layerMode, highlighted
   const derivedEdges = [];
   const pairDerivedCounts = new Map();
   for (const node of graph.nodes) {
-    const turnPairId = firstTurnPairId(node);
+    const turnPairId = resolveFirstTurnPairId(node, pairNodeIds);
     const anchor = positions.get(turnPairId) || { x: 180, y: 220 };
     const nextOffset = pairDerivedCounts.get(turnPairId) || 0;
     pairDerivedCounts.set(turnPairId, nextOffset + 1);
@@ -376,7 +376,7 @@ export function buildLayerGraph({ graph, transcriptPairs, layerMode, highlighted
       },
       position: orbitPosition(anchor, nextOffset)
     });
-    if (turnPairId) {
+    if (turnPairId && pairNodeIds.has(turnPairId)) {
       derivedEdges.push({
         data: {
           id: `derived:${node.id}:${turnPairId}`,
@@ -390,18 +390,30 @@ export function buildLayerGraph({ graph, transcriptPairs, layerMode, highlighted
     }
   }
 
+  const allNodes = [...bothNodes];
+  const renderNodeIds = new Set(allNodes.map((item) => item.data.id));
+  const renderEdges = [...semanticEdges, ...transcriptEdges, ...derivedEdges].filter(
+    (edge) => renderNodeIds.has(edge.data.source) && renderNodeIds.has(edge.data.target)
+  );
+
   return {
-    elements: [...bothNodes, ...semanticEdges, ...transcriptEdges, ...derivedEdges],
+    elements: [...allNodes, ...renderEdges],
     layout: { name: "preset", fit: true, padding: GRAPH_TOKENS.spacing.canvasPadding }
   };
 }
 
-export function firstTurnPairId(node) {
-  const firstEvidence = (node.evidence_records || [])[0];
-  if (!firstEvidence) {
-    return "";
+function resolveFirstTurnPairId(node, validPairIds = null) {
+  for (const evidence of node.evidence_records || []) {
+    const pairId = `${evidence.session_id || node.session_id || "default"}:pair:${Math.floor((evidence.turn_index || 0) / 2)}`;
+    if (!validPairIds || validPairIds.has(pairId)) {
+      return pairId;
+    }
   }
-  return `${firstEvidence.session_id || node.session_id || "default"}:pair:${Math.floor((firstEvidence.turn_index || 0) / 2)}`;
+  return "";
+}
+
+export function firstTurnPairId(node) {
+  return resolveFirstTurnPairId(node, null);
 }
 
 export function buildProvenanceTrail(node, graph) {
