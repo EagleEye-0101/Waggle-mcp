@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, TypeVar
 
-from retrieval.scorers.topic_relevance import TopicScore, score_topic_relevance
-
+from waggle.retrieval.scorers.topic_relevance import TopicScore, score_topic_relevance
 
 TOPIC_THRESHOLD = 0.35
 TemporalDirection = Literal["latest", "oldest"]
@@ -65,14 +64,12 @@ def rank_temporal(
                 candidate,
                 semantic_similarity_fn=semantic_similarity_fn,
             ),
-            timestamp=parse_timestamp(getattr(candidate, "ts")),
+            timestamp=parse_timestamp(candidate.ts),
         )
         for candidate in candidates
     ]
 
-    survivors = [
-        item for item in ranked if item.topic_score.combined >= topic_threshold
-    ]
+    survivors = [item for item in ranked if item.topic_score.combined >= topic_threshold]
     if not survivors:
         fallback_limit = min(len(ranked), top_k * 2)
         survivors = sorted(
