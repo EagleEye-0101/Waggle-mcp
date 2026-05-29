@@ -5466,7 +5466,7 @@ def _write_codex(db_path: str, python_exe: str) -> Path:
     config_file = config_dir / "config.toml"
     # Escape backslashes in Windows paths for TOML (and regex replacement)
     db_path_escaped = db_path.replace("\\", "\\\\")
-    
+
     toml_block = (
         "[mcp_servers.waggle]\n"
         f'command = "{_default_stdio_command()}"\n'
