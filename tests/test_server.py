@@ -486,7 +486,6 @@ def test_doctor_json_output_ok_status(
         neo4j_database="",
     )
 
-
     exit_code = _run_doctor(config, json_output=True)
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -545,7 +544,6 @@ def test_doctor_json_output_warning_status_for_uncached_model(
     assert payload["status"] == "warnings"
     assert payload["issues"] == []
     assert any("not found in cache" in warning for warning in payload["warnings"])
-
 
 
 def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
