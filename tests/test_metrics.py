@@ -60,3 +60,16 @@ def test_multiple_metrics_sorted():
     output = registry.render_prometheus()
 
     assert output.index("a_metric") < output.index("z_metric")
+
+
+def test_format_labels_escapes_special_characters():
+    labels = (
+        (
+            "message",
+            'quote" backslash\\ newline\n',
+        ),
+    )
+
+    result = MetricsRegistry._format_labels(labels)
+
+    assert result == '{message="quote\\" backslash\\\\ newline\\n"}'
