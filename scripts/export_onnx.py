@@ -1,40 +1,49 @@
 """
-waggle-mcp export onnx
-============================
-Loads the all-MiniLM-L6-v2 model via SentenceTransformer and exports it to ONNX format (either via backend="onnx" or optimum).
+scripts/export_onnx.py
 
-Usage
------
+Part of ONNX Runtime migration (Issue #121).
+Exports `all-MiniLM-L6-v2` to ONNX and validates numerical parity and timing against PyTorch.
 
-Requirements: pip install --upgrade onnx onnxscript sentence-transformers optimum[onnx]
+Requirements:
+    pip install "sentence-transformers>=2.7.0" "optimum[onnxruntime]"
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import onnx
-import onnxruntime
-from waggle.embeddings import EmbeddingModel
-import numpy as np
+import os
 import time
-from transformers import AutoTokenizer
+import shutil
+import numpy as np
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
 
-# ---------------------------------------------------------------------------
-# Load the model
-# ---------------------------------------------------------------------------
-embed_model = EmbeddingModel("deterministic")
+def get_dir_size_mb(path: str) -> float:
+    total_size = sum(f.stat().st_size for f in Path(path).glob('**/*') if f.is_file())
+    return total_size / (1024 * 1024)
 
-# ---------------------------------------------------------------------------
-# Export as ONNX + saving ONNX
-# ---------------------------------------------------------------------------
-onnx_program = torch.onnx.export(model=embed_model, dynamo=True)
-onnx_program.save("embeddings_model.onnx")
+def main():
+    model_name = "all-MiniLM-L6-v2"
+    export_dir = "../onnx_model"
 
-# ---------------------------------------------------------------------------
-# Comparison - original model vs. ONNX-loaded model
-# ---------------------------------------------------------------------------
+    print(f"=== 1. Loading original PyTorch model: {model_name} ===")
+    model_pt = SentenceTransformer(model_name)
 
-contents = [
+    print(f"\n=== 2. Exporting to ONNX format ===")
+    # Using ST-native ONNX backend. 
+    # model_kwargs={"export": True} forces optimum to build the ONNX graph locally.
+    model_onnx = SentenceTransformer(
+        model_name, 
+        backend="onnx", 
+        model_kwargs={"export": True}
+    )
+    
+    # Save the artifact to fulfill the issue requirements
+    if os.path.exists(export_dir):
+        shutil.rmtree(export_dir)
+    model_onnx.save(export_dir)
+    print(f"ONNX artifact and tokenizer saved to ./{export_dir}/")
+
+    print("\n=== 3. Validating Output Parity ===")
+    sentences = [
     "We decided to use PostgreSQL as the primary database for the Acme web app. PostgreSQL offers ACID compliance, rich JSON support, and scales well for our expected load.",
     "PostgreSQL was chosen because the team has prior experience with it, it supports JSONB for flexible schema evolution, and the managed RDS offering fits our AWS deployment plan.",
     "For local development, we switched to SQLite to eliminate the Docker dependency and speed up onboarding. Production still targets PostgreSQL.",
@@ -50,41 +59,50 @@ contents = [
     "The team strongly prefers small, focused PRs — ideally under 400 lines. Large PRs block review and increase merge conflict risk. Feature flags are the preferred mechanism for shipping incomplete features.",
     "The Acme web app team has 4 engineers: 2 full-stack, 1 backend, 1 frontend/design. No dedicated DevOps or security engineer.",
     "The target public launch date is end of Q3. The v1 scope is intentionally narrow: auth, core CRUD, and basic reporting. v2 will add integrations and advanced analytics."
-]
+    ]
 
-# Option 1: original embedding model created from the EmbeddingModel class, embeddings extracted one by one
-embeddings_original = np.array([])
-start_time = time.perf_counter()
-for c in contents:
-    e = embed_model.embed(c)
-    embeddings_original = np.append(embeddings_original, e)
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-print(f"Original model: embeddings obtained in {elapsed_time:.6f} seconds")
+    embeddings_pt = model_pt.encode(sentences, convert_to_numpy=True)
+    embeddings_onnx = model_onnx.encode(sentences, convert_to_numpy=True)
 
-# Option 2: original embedding model created from the EmbeddingModel class, batch-processed embeddings extraction
-start_time = time.perf_counter()
-embeddings_batched = embed_model.embed_batch(contents)
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-print(f"Original model with batching: embeddings obtained in {elapsed_time:.6f} seconds")
+    print("Checking cosine similarity for each sentence pair...")
+    for i, text in enumerate(sentences):
+        # Calculate cosine similarity between the Torch and ONNX vectors
+        sim = cos_sim(embeddings_pt[i], embeddings_onnx[i]).item()
+        print(f"  Sentence {i+1} similarity: {sim:.6f}")
+        
+        # Assert parity >= 0.999 per acceptance criteria
+        assert sim >= 0.999, f"Parity failed for sentence {i+1}: similarity = {sim}"
+        
+    print("Parity check passed! All similarities are >= 0.999.")
 
-# Loading the saved ONNX file
-onnx_model = onnx.load("embeddings_model.onnx")
-onnx.checker.check_model(onnx_model)
-tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-model_inputs = [tokenizer(c, return_tensors="np") for c in contents]
-ort_session = onnxruntime.InferenceSession(
-    "embeddings_model.onnx", providers=["CPUExecutionProvider"]
-)
-onnxruntime_input = {input_arg.name: input_value for input_arg, input_value in zip(ort_session.get_inputs(), model_inputs)}
+    print("\n=== 4. Performance and Size Comparison ===")
+    
+    onnx_size = get_dir_size_mb(export_dir)
+    print(f"  Exported ONNX Directory Size: {onnx_size:.2f} MB")
 
-# Option 3: loaded ONNX model, embeddings extracted one by one
-start_time = time.perf_counter()
-output_onnx = onnx_model.run(None, dict(model_inputs))
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-print(f"Original model: embeddings obtained in {elapsed_time:.6f} seconds")
+    iterations = 50
+    print(f"\nBenchmarking over {iterations} iterations (Batch size: {len(sentences)})...")
+    
+    # Warmup
+    _ = model_pt.encode(sentences)
+    _ = model_onnx.encode(sentences)
 
+    # PyTorch timing
+    start_pt = time.perf_counter()
+    for _ in range(iterations):
+        _ = model_pt.encode(sentences)
+    time_pt = time.perf_counter() - start_pt
+    
+    # ONNX timing
+    start_onnx = time.perf_counter()
+    for _ in range(iterations):
+        _ = model_onnx.encode(sentences)
+    time_onnx = time.perf_counter() - start_onnx
 
+    print(f"PyTorch Time : {time_pt:.4f}s")
+    print(f"ONNX Time    : {time_onnx:.4f}s")
+    print(f"Speedup      : {time_pt / time_onnx:.2f}x faster")
+
+if __name__ == "__main__":
+    main()
 
