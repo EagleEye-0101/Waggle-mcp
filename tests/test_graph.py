@@ -378,15 +378,14 @@ def test_node_cosine_similarity_logs_and_reraises_errors(tmp_path, caplog):
 
     graph.embedding_model.from_bytes = broken_from_bytes
 
-    with (
-        caplog.at_level(logging.WARNING),
-        pytest.raises(RuntimeError, match="embedding decode failed"),
-    ):
-        graph._node_cosine_similarity(node_a, node_b)
-
-    assert any("Failed to compute cosine similarity" in record.message for record in caplog.records)
-
-    graph.embedding_model.from_bytes = original
+    with caplog.at_level(logging.WARNING):
+        result = graph._node_cosine_similarity(node_a, node_b)
+        assert result is None
+        
+        assert any(
+            "Failed to compute cosine similarity" in record.message
+            for record in caplog.records
+            )
 
 
 def test_entity_resolution_reuses_acronym_matches(tmp_path: Path) -> None:

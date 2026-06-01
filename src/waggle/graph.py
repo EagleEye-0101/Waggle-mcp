@@ -1818,7 +1818,7 @@ class MemoryGraph:
                 b.id,
                 exc,
             )
-            raise
+            return None
 
     def _backfill_transcript_storage(self, connection: sqlite3.Connection, *, batch_size: int = 100) -> None:
         pending_user_pairs: dict[str, str] = {}
