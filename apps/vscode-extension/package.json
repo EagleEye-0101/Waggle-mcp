@@ -33,17 +33,7 @@
     "Knowledge Graph"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:waggle.enableWorkspace",
-    "onCommand:waggle.install",
-    "onCommand:waggle.doctor",
-    "onCommand:waggle.openGraphStudio",
-    "onCommand:waggle.showStatus",
-    "onCommand:waggle.exportMemory",
-    "onCommand:waggle.openInstallDocs",
-    "onCommand:waggle.queryMemory",
-    "onCommand:waggle.observeConversation",
-    "onView:waggle.graphStudio"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "dependencies": {
