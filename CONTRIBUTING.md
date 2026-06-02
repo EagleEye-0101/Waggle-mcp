@@ -213,13 +213,27 @@ export WAGGLE_EMBEDDING_BACKEND=onnx
 
 ### ONNX Runtime Requirements
 
-Using `WAGGLE_EMBEDDING_BACKEND=onnx` requires ONNX Runtime dependencies to be installed.
+Using `WAGGLE_EMBEDDING_BACKEND=onnx` requires additional ONNX runtime dependencies.
 
-If ONNX dependencies are unavailable, model initialization may fail and fall back to deterministic embeddings.
+Install the required packages:
+
+```bash
+pip install onnxruntime optimum
+``` 
+
+Then configure:
+
+```bash
+export WAGGLE_EMBEDDING_BACKEND=onnx
+```
+
+Supported values:
+- `pytorch` (default)
+- `onnx`
+
+If ONNX dependencies are unavailable, model initialization may fail and Waggle will fall back to deterministic embeddings.
 
 Use the default `pytorch` backend unless you specifically want ONNX Runtime inference.
-
----
 
 ## How to Submit a PR
 
