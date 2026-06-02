@@ -45,8 +45,16 @@ class TestWriteLock:
                 time.sleep(hold)
                 log.append(f"{label}_out")
 
-        t1 = _start(lambda: worker("A", 0.05))
-        time.sleep(0.01)
+        a_inside = threading.Event()
+        _orig_worker = worker
+        def worker_a(label: str, hold: float) -> None:
+            with lock:
+                a_inside.set()
+                log.append(f"{label}_in")
+                time.sleep(hold)
+                log.append(f"{label}_out")
+        t1 = _start(lambda: worker_a("A", 0.05))
+        a_inside.wait(timeout=2)
         t2 = _start(lambda: worker("B", 0.05))
         t1.join(timeout=3)
         t2.join(timeout=3)
@@ -321,8 +329,27 @@ class TestIssue67:
             with lock.read():
                 b_read_ok.set()
 
+        a_inside = threading.Event()
+        b_can_start = threading.Event()
+
+        def thread_a() -> None:
+            with lock.read():
+                a_inside.set()
+                b_can_start.wait(timeout=2)
+                try:
+                    with lock:
+                        pass
+                except RuntimeError:
+                    pass
+
+        def thread_b() -> None:
+            with lock.read():
+                b_read_ok.set()
+
         ta = _start(thread_a)
-        ta.join(timeout=2)
+        a_inside.wait(timeout=2)
         tb = _start(thread_b)
+        b_can_start.set()
         assert b_read_ok.wait(timeout=2), "Thread B could not acquire read lock"
+        ta.join(timeout=2)
         tb.join(timeout=2)
