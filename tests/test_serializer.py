@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from waggle.models import (
     ConflictRecord,
     ContextTimelineItem,
@@ -53,6 +55,26 @@ def test_serialize_recent_nodes_nonempty():
 def test_format_updated_ago_under_one_minute():
     timestamp = datetime.now(UTC) - timedelta(seconds=30)
     assert _format_updated_ago(timestamp) == "just now"
+
+
+def test_format_updated_ago_none_timestamp():
+    assert _format_updated_ago(None) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (59, "just now"),
+        (61, "1 minute ago"),
+        (3599, "59 minutes ago"),
+        (3601, "1 hour ago"),
+        (86399, "23 hours ago"),
+        (86401, "1 day ago"),
+    ],
+)
+def test_format_updated_ago_around_bucket_boundaries(seconds, expected):
+    timestamp = datetime.now(UTC) - timedelta(seconds=seconds)
+    assert _format_updated_ago(timestamp) == expected
 
 
 def test_format_updated_ago_at_one_minute_boundary():
