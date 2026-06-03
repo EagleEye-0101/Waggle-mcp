@@ -1,9 +1,13 @@
 import * as fs from "fs/promises";
-import { readFileSync } from "fs";
 import * as https from "https";
 import * as path from "path";
 import * as vscode from "vscode";
-import { assetFileNameForCurrentPlatform, platformAssetKey } from "./platform";
+import {
+  assetFileNameForCurrentPlatform,
+  buildAssetNameToPlatformKeyMap,
+  platformAssetKey,
+  type PlatformAssetKey
+} from "./platform";
 
 export interface BundleMetadata {
   version: string;
@@ -12,6 +16,7 @@ export interface BundleMetadata {
 }
 
 const DEFAULT_REPO = "Abhigyan-Shekhar/Waggle-mcp";
+const NETWORK_TIMEOUT_MS = 60_000;
 
 export class BinaryResolver {
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -33,7 +38,6 @@ export class BinaryResolver {
     if (await this.hasCachedBinary()) {
       return await this.cachedBinaryPath();
     }
-    // Until GitHub Release ships PyInstaller assets, honor an explicit local CLI path.
     if (path.isAbsolute(configured)) {
       try {
         await fs.access(configured);
@@ -54,14 +58,19 @@ export class BinaryResolver {
     }
   }
 
-  private async cachedBinaryPath(): Promise<string> {
-    const version = await this.resolveBinaryVersion();
+  private async cachedBinaryPathForVersion(version: string): Promise<string> {
     const assetName = assetFileNameForCurrentPlatform();
     return path.join(this.cacheRoot(), version, assetName);
   }
 
+  private async cachedBinaryPath(): Promise<string> {
+    const version = await this.resolveRequestedVersion();
+    return this.cachedBinaryPathForVersion(version);
+  }
+
   async ensureBinary(): Promise<string> {
-    const destPath = await this.cachedBinaryPath();
+    const metadata = await this.fetchBundleMetadata();
+    const destPath = await this.cachedBinaryPathForVersion(metadata.version);
     try {
       await fs.access(destPath);
       return destPath;
@@ -69,9 +78,10 @@ export class BinaryResolver {
       // download below
     }
 
-    const version = await this.resolveBinaryVersion();
-    const assetName = assetFileNameForCurrentPlatform();
-    const destDir = path.dirname(destPath);
+    const assetName = metadata.assets[platformAssetKey()];
+    if (!assetName) {
+      throw new Error(`Release v${metadata.version} has no asset for ${platformAssetKey()}`);
+    }
 
     await vscode.window.withProgress(
       {
@@ -80,8 +90,8 @@ export class BinaryResolver {
         cancellable: false
       },
       async () => {
-        await fs.mkdir(destDir, { recursive: true });
-        const url = await this.resolveDownloadUrl(version, assetName);
+        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        const url = `https://github.com/${metadata.repository}/releases/download/v${metadata.version}/${assetName}`;
         await this.downloadFile(url, destPath);
         if (process.platform !== "win32") {
           await fs.chmod(destPath, 0o755);
@@ -92,7 +102,7 @@ export class BinaryResolver {
     return destPath;
   }
 
-  private async resolveBinaryVersion(): Promise<string> {
+  private async resolveRequestedVersion(): Promise<string> {
     const override = this.config().get<string>("binaryVersion", "").trim();
     if (override) {
       return override;
@@ -100,34 +110,35 @@ export class BinaryResolver {
     return this.context.extension.packageJSON.version as string;
   }
 
-  private async resolveDownloadUrl(version: string, assetName: string): Promise<string> {
+  private async fetchBundleMetadata(): Promise<BundleMetadata> {
     const repo = this.config().get<string>("binaryReleaseRepo", DEFAULT_REPO).trim() || DEFAULT_REPO;
-    const metadata = await this.fetchBundleMetadata(repo, version);
-    const mapped = metadata.assets[platformAssetKey()];
-    if (mapped !== assetName) {
-      throw new Error(`Release ${version} asset mismatch for ${platformAssetKey()}`);
-    }
-    return `https://github.com/${repo}/releases/download/v${metadata.version}/${assetName}`;
-  }
+    const requestedVersion = await this.resolveRequestedVersion();
 
-  private async fetchBundleMetadata(repo: string, version: string): Promise<BundleMetadata> {
-    const fromRelease = await this.tryFetchReleaseMetadata(repo, version);
+    const fromRelease = await this.tryFetchReleaseMetadata(repo, requestedVersion);
     if (fromRelease) {
       return fromRelease;
     }
-    const latest = await this.tryFetchLatestMetadata(repo);
-    if (latest) {
-      return latest;
+
+    if (this.config().get<boolean>("binaryAllowLatestFallback", false)) {
+      const latest = await this.tryFetchLatestMetadata(repo);
+      if (latest) {
+        return latest;
+      }
     }
-    return this.loadBundledMetadata();
+
+    throw new Error(
+      `No GitHub release v${requestedVersion} with Waggle binaries for ${platformAssetKey()}. ` +
+        "Set waggle.commandPath, waggle.installMethod to pipx, enable waggle.binaryAllowLatestFallback, or wait for a maintainer release."
+    );
   }
 
   private async tryFetchReleaseMetadata(repo: string, version: string): Promise<BundleMetadata | undefined> {
     try {
-      const release = await this.fetchJson<{ tag_name: string; assets: { name: string; browser_download_url: string }[] }>(
-        `https://api.github.com/repos/${repo}/releases/tags/v${version}`
-      );
-      return this.metadataFromRelease(release);
+      const release = await this.fetchJson<{
+        tag_name: string;
+        assets: { name: string }[];
+      }>(`https://api.github.com/repos/${repo}/releases/tags/v${version}`);
+      return this.metadataFromRelease(release, repo);
     } catch {
       return undefined;
     }
@@ -135,46 +146,49 @@ export class BinaryResolver {
 
   private async tryFetchLatestMetadata(repo: string): Promise<BundleMetadata | undefined> {
     try {
-      const release = await this.fetchJson<{ tag_name: string; assets: { name: string; browser_download_url: string }[] }>(
-        `https://api.github.com/repos/${repo}/releases/latest`
-      );
-      return this.metadataFromRelease(release);
+      const release = await this.fetchJson<{
+        tag_name: string;
+        assets: { name: string }[];
+      }>(`https://api.github.com/repos/${repo}/releases/latest`);
+      return this.metadataFromRelease(release, repo);
     } catch {
       return undefined;
     }
   }
 
-  private metadataFromRelease(release: {
-    tag_name: string;
-    assets: { name: string }[];
-  }): BundleMetadata {
+  private metadataFromRelease(
+    release: { tag_name: string; assets: { name: string }[] },
+    repo: string
+  ): BundleMetadata {
     const version = release.tag_name.replace(/^v/, "");
-    const bundled = this.loadBundledMetadataSync();
-    const assets: Record<string, string> = { ...bundled.assets };
+    const nameToKey = buildAssetNameToPlatformKeyMap();
+    const assets: Partial<Record<PlatformAssetKey, string>> = {};
+
     for (const asset of release.assets) {
-      for (const [key, expected] of Object.entries(assets)) {
-        if (asset.name === expected) {
-          assets[key] = expected;
-        }
+      const key = nameToKey.get(asset.name);
+      if (key) {
+        assets[key] = asset.name;
       }
     }
-    return { version, repository: DEFAULT_REPO, assets };
-  }
 
-  private async loadBundledMetadata(): Promise<BundleMetadata> {
-    const uri = vscode.Uri.joinPath(this.context.extensionUri, "resources", "bundle-metadata.json");
-    const raw = await fs.readFile(uri.fsPath, "utf8");
-    return JSON.parse(raw) as BundleMetadata;
-  }
+    const platform = platformAssetKey();
+    const expectedName = assetFileNameForCurrentPlatform();
+    const actualName = assets[platform];
+    if (!actualName) {
+      throw new Error(
+        `Release v${version} is missing ${expectedName} for ${platform}. Available: ${release.assets.map((a) => a.name).join(", ") || "(none)"}`
+      );
+    }
 
-  private loadBundledMetadataSync(): BundleMetadata {
-    const filePath = path.join(this.context.extensionPath, "resources", "bundle-metadata.json");
-    return JSON.parse(readFileSync(filePath, "utf8")) as BundleMetadata;
+    return { version, repository: repo, assets: assets as Record<string, string> };
   }
 
   private fetchJson<T>(url: string): Promise<T> {
     return new Promise((resolve, reject) => {
-      const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "waggle-vscode-extension" };
+      const headers: Record<string, string> = {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "waggle-vscode-extension"
+      };
       const request = https.get(url, { headers }, (response) => {
         if (response.statusCode === 302 || response.statusCode === 301) {
           const location = response.headers.location;
@@ -198,6 +212,10 @@ export class BinaryResolver {
         });
       });
       request.on("error", reject);
+      request.setTimeout(NETWORK_TIMEOUT_MS, () => {
+        request.destroy();
+        reject(new Error(`GitHub API request timed out for ${url}`));
+      });
     });
   }
 
@@ -224,6 +242,10 @@ export class BinaryResolver {
         });
       });
       request.on("error", reject);
+      request.setTimeout(NETWORK_TIMEOUT_MS, () => {
+        request.destroy();
+        reject(new Error(`Binary download timed out for ${url}`));
+      });
     });
   }
 }
