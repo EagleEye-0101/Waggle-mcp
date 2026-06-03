@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "child_process";
+import { execFile, spawn, type ChildProcess } from "child_process";
 import * as fs from "fs/promises";
 import * as http from "http";
 import * as path from "path";
@@ -8,8 +8,9 @@ import { BinaryResolver } from "./binary-resolver";
 export interface ServerRuntime {
   baseUrl: string;
   port: number;
-  command: string;
 }
+
+const STOP_TIMEOUT_MS = 8_000;
 
 export class ServerManager {
   private child: ChildProcess | undefined;
@@ -29,41 +30,25 @@ export class ServerManager {
     }
     return {
       baseUrl: `http://127.0.0.1:${this.port}`,
-      port: this.port,
-      command: ""
+      port: this.port
     };
   }
 
   async start(env: Record<string, string>, cwd?: string): Promise<ServerRuntime> {
     if (this.child) {
-      return (await this.waitForHealthy(this.port))
-        ? { baseUrl: `http://127.0.0.1:${this.port}`, port: this.port, command: "" }
-        : this.restart(env, cwd);
+      if (await this.waitForHealthy(this.port)) {
+        return { baseUrl: `http://127.0.0.1:${this.port}`, port: this.port };
+      }
+      return this.restart(env, cwd);
     }
 
     const command = await this.resolver.resolveCommandPath();
     this.port = this.context.globalState.get<number>("waggle.httpPort", 18765);
-    // edit-graph is the stable CLI name; graph-studio is a newer alias not in older PyPI builds.
     const args = ["edit-graph", "--host", "127.0.0.1", "--port", String(this.port), "--no-open"];
     this.log(`Starting ${command} ${args.join(" ")}`);
 
-    const child = spawn(command, args, {
-      cwd,
-      env: { ...process.env, ...env },
-      detached: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    });
+    const child = await this.spawnManagedProcess(command, args, env, cwd);
     this.child = child;
-    child.stdout?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
-    child.stderr?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
-    child.on("exit", (code) => {
-      this.log(`graph-studio exited (${String(code ?? 0)})`);
-      if (this.child === child) {
-        this.child = undefined;
-        this.onDidChangeEmitter.fire(undefined);
-      }
-    });
 
     const healthy = await this.waitForHealthy(this.port, 60_000);
     if (!healthy) {
@@ -72,7 +57,7 @@ export class ServerManager {
     }
 
     await this.context.globalState.update("waggle.httpPort", this.port);
-    const runtime = { baseUrl: `http://127.0.0.1:${this.port}`, port: this.port, command };
+    const runtime = { baseUrl: `http://127.0.0.1:${this.port}`, port: this.port };
     this.onDidChangeEmitter.fire(runtime);
     return runtime;
   }
@@ -85,15 +70,82 @@ export class ServerManager {
   async stop(): Promise<void> {
     const child = this.child;
     this.child = undefined;
-    if (!child) {
+    if (!child?.pid) {
+      this.onDidChangeEmitter.fire(undefined);
       return;
     }
+
     if (process.platform === "win32") {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+      await this.stopWindowsProcess(child);
     } else {
       child.kill("SIGTERM");
+      await this.waitForChildExit(child, STOP_TIMEOUT_MS);
     }
     this.onDidChangeEmitter.fire(undefined);
+  }
+
+  private spawnManagedProcess(
+    command: string,
+    args: string[],
+    env: Record<string, string>,
+    cwd?: string
+  ): Promise<ChildProcess> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd,
+        env: { ...process.env, ...env },
+        detached: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      });
+
+      child.stdout?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
+      child.stderr?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
+
+      child.on("error", (error) => {
+        if (this.child === child) {
+          this.child = undefined;
+          this.onDidChangeEmitter.fire(undefined);
+        }
+        reject(new Error(`Failed to start Waggle server (${command}): ${error.message}`));
+      });
+
+      child.on("exit", (code) => {
+        this.log(`edit-graph exited (${String(code ?? 0)}).`);
+        if (this.child === child) {
+          this.child = undefined;
+          this.onDidChangeEmitter.fire(undefined);
+        }
+      });
+
+      resolve(child);
+    });
+  }
+
+  private waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(), timeoutMs);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  private stopWindowsProcess(child: ChildProcess): Promise<void> {
+    return new Promise((resolve) => {
+      execFile(
+        "taskkill",
+        ["/pid", String(child.pid), "/T", "/F"],
+        { windowsHide: true },
+        () => {
+          void this.waitForChildExit(child, STOP_TIMEOUT_MS).then(() => resolve());
+        }
+      );
+    });
   }
 
   private async waitForHealthy(port: number, timeoutMs = 30_000): Promise<boolean> {
