@@ -11,7 +11,7 @@ injection with a persistent knowledge graph and targeted retrieval.
 
 Without a memory layer, every prompt looks like this:
 
-```
+```text
 [System prompt]
 [Turn 1 — user + assistant]
 [Turn 2 — user + assistant]
@@ -56,7 +56,7 @@ configurable token budget (default: **1 200 tokens**, set via
 
 The prompt injected into each LLM call becomes:
 
-```
+```text
 [System prompt]
 [Waggle context pack — ≤ 1 200 tokens of targeted memory]
 [Current user message]
@@ -81,7 +81,7 @@ Every call receives the full transcript. By turn 10, each prompt carries all
 ten turns (~250 tokens each on average), and the same fact appears three times
 with no added value.
 
-```
+```text
 10 turns × ~250 tokens = 2 500 context tokens per call
 Cumulative across 10 calls = ~13 750 context tokens
 ```
@@ -90,7 +90,7 @@ Cumulative across 10 calls = ~13 750 context tokens
 
 After turn 2, `observe_conversation` writes a single decision node:
 
-```
+```text
 Label:   "Database choice"
 Content: "PostgreSQL chosen for production; required for analytics joins."
 Type:    decision
@@ -103,7 +103,7 @@ existing node rather than creating a duplicate.
 
 At turn 10, `build_context` retrieves one node and returns:
 
-```
+```text
 ### Waggle Recursive Context Pack
 Task: confirming production database
 
@@ -119,8 +119,9 @@ Current relevant decisions:
 
 Token counts are computed with the `ceil(len(text) / 4)` heuristic used
 throughout the codebase, with tiktoken `cl100k_base` applied automatically
-when available. All runs use `WAGGLE_MODEL=deterministic` — no API key
-required.
+when available. In `recursive_context.py`, real-time budget tracking uses
+`len(text) // 4`, which can differ by at most one token per string. All runs use
+`WAGGLE_MODEL=deterministic` — no API key required.
 
 | Scenario | Turns | Recurring facts | Baseline tokens | Waggle tokens | Reduction |
 |---|---|---|---|---|---|
@@ -173,8 +174,10 @@ and stops the moment the token estimate crosses the budget ceiling:
 DEFAULT_TOKEN_BUDGET: int = _env_int("WAGGLE_RECURSIVE_CONTEXT_DEFAULT_BUDGET", 1200)
 ```
 
-The budget is an absolute cap, not a soft target. Context pack size does not
-grow as the conversation continues.
+The budget is a target ceiling, not a hard limit. The implementation computes
+`max_tokens = int(token_budget * 1.15)`, permitting up to ~15% overage to
+avoid cutting off the last entry mid-section. In practice the context pack
+remains tightly bounded and does not grow with conversation length.
 
 ---
 
@@ -213,7 +216,7 @@ stdout and optionally saved to `results/`.
 
 ## Summary
 
-```
+```text
 Without Waggle                        With Waggle
 ────────────────────────────────────  ────────────────────────────────────
 Prompt size grows every turn          Prompt size stays within budget
