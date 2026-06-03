@@ -34,7 +34,7 @@ jobs:
 
   # ── Tests ─────────────────────────────────────────────────────────────────
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -58,12 +58,19 @@ jobs:
       - name: Install project + dev dependencies
         run: pip install -e ".[dev]"
 
+      - name: Verify critical dependencies
+        run: |
+          pip list
+          python -c "import networkx; print('networkx OK')"
+          python -c "import pytest; print('pytest OK')"
+          python -c "import waggle; print('waggle OK')"
+
       # Use deterministic embeddings so tests never require a 420 MB download
       - name: Run tests (deterministic mode, no ML)
         env:
           WAGGLE_MODEL: deterministic
           PYTHONUTF8: "1"   # prevents UnicodeEncodeError on Windows
-        run: pytest -q --tb=short -x
+        run: pytest -v --tb=long
 
   # ── Packaging smoke-test ───────────────────────────────────────────────────
   package:
@@ -87,3 +94,50 @@ jobs:
         run: |
           pip install twine
           twine check dist/*
+
+  # ── VS Code extension ────────────────────────────────────────────────────
+  vscode-extension:
+    name: VS Code extension validation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/vscode-extension
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/vscode-extension/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile extension
+        run: npm run compile
+
+  graph-studio:
+    name: Graph Studio validation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mcp/graph-ui
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/mcp/graph-ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Graph Studio
+        run: npm run build

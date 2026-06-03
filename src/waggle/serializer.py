@@ -24,18 +24,21 @@ from waggle.models import (
 )
 
 
-def _format_updated_ago(timestamp: datetime) -> str:
+def _format_updated_ago(timestamp: datetime | None) -> str:
+    if timestamp is None:
+        return "unknown"
+
     now = datetime.now(UTC)
     delta = max((now - timestamp.astimezone(UTC)).total_seconds(), 0.0)
     if delta < 60:
         return "just now"
     if delta < 3600:
-        minutes = max(1, round(delta / 60.0))
+        minutes = max(1, int(delta // 60))
         return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
     if delta < 86400:
-        hours = max(1, round(delta / 3600.0))
+        hours = max(1, int(delta // 3600))
         return f"{hours} hour{'s' if hours != 1 else ''} ago"
-    days = max(1, round(delta / 86400.0))
+    days = max(1, int(delta // 86400))
     return f"{days} day{'s' if days != 1 else ''} ago"
 
 
@@ -65,9 +68,13 @@ def serialize_subgraph(result: SubgraphResult) -> str:
         ]
         for index, hit in enumerate(result.hybrid_hits, start=1):
             reasoning = f" reason={hit.reasoning_from_reranker}" if hit.reasoning_from_reranker else ""
+            explanation = (
+                " | ".join(f"{k}={v}" for k, v in hit.score_explanation.items()) if hit.score_explanation else "n/a"
+            )
             lines.append(
                 f"• #{index} [{hit.source}] {hit.content[:400]} [score={hit.score:.4f}] "
-                f"(turn_pair={hit.turn_pair_id or 'n/a'}, node_ids={hit.node_ids}){reasoning}"
+                f"(turn_pair={hit.turn_pair_id or 'n/a'}, node_ids={hit.node_ids}){reasoning} "
+                f"[score_explanation: {explanation}]"
             )
         lines.extend(["", "=== End Results ==="])
         return "\n".join(lines)
