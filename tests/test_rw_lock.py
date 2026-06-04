@@ -41,6 +41,7 @@ def _start(fn, *, daemon: bool = True) -> threading.Thread:
     t.start()
     return t
 
+
 def _join(t: threading.Thread, timeout: float = 2) -> None:
     """Join *t* and re-raise any exception it captured."""
     t.join(timeout=timeout)
@@ -48,6 +49,7 @@ def _join(t: threading.Thread, timeout: float = 2) -> None:
     exc_box = getattr(t, "_exc_box", [])
     if exc_box:
         raise exc_box[0]
+
 
 class TestWriteLock:
     def test_exclusive_between_threads(self):
