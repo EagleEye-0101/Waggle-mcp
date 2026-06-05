@@ -50,12 +50,7 @@ export class BinaryResolver {
   }
 
   async hasCachedBinary(): Promise<boolean> {
-    try {
-      await fs.access(await this.cachedBinaryPath());
-      return true;
-    } catch {
-      return false;
-    }
+    return (await this.resolveCachedBinaryPath()) !== undefined;
   }
 
   private async cachedBinaryPathForVersion(version: string): Promise<string> {
@@ -64,8 +59,39 @@ export class BinaryResolver {
   }
 
   private async cachedBinaryPath(): Promise<string> {
-    const version = await this.resolveRequestedVersion();
-    return this.cachedBinaryPathForVersion(version);
+    const discovered = await this.resolveCachedBinaryPath();
+    if (discovered) {
+      return discovered;
+    }
+    return this.cachedBinaryPathForVersion(await this.resolveRequestedVersion());
+  }
+
+  private async resolveCachedBinaryPath(): Promise<string | undefined> {
+    const requested = await this.resolveRequestedVersion();
+    const requestedPath = await this.cachedBinaryPathForVersion(requested);
+    try {
+      await fs.access(requestedPath);
+      return requestedPath;
+    } catch {
+      // fall through — binary may be cached under a fallback release version
+    }
+
+    try {
+      const versions = await fs.readdir(this.cacheRoot());
+      const assetName = assetFileNameForCurrentPlatform();
+      for (const version of versions) {
+        const candidate = path.join(this.cacheRoot(), version, assetName);
+        try {
+          await fs.access(candidate);
+          return candidate;
+        } catch {
+          // try next cached version
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
   }
 
   async ensureBinary(): Promise<string> {

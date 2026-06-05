@@ -18,6 +18,7 @@ assert.equal(resolvePlatformAssetKey("darwin", "arm64"), "darwin-arm64");
 assert.equal(resolvePlatformAssetKey("linux", "x64"), "linux-x64");
 assert.throws(() => resolvePlatformAssetKey("win32", "arm64"), /Windows ARM64/);
 assert.throws(() => resolvePlatformAssetKey("linux", "arm64"), /Linux ARM64/);
+assert.throws(() => resolvePlatformAssetKey("linux", "ia32"), /Unsupported architecture/);
 assert.equal(typeof platformAssetKey(), "string");
 
 console.log("platform asset map ok");

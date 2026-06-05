@@ -15,6 +15,7 @@ const STOP_TIMEOUT_MS = 8_000;
 export class ServerManager {
   private child: ChildProcess | undefined;
   private port = 0;
+  private startPromise: Promise<ServerRuntime> | undefined;
   private readonly onDidChangeEmitter = new vscode.EventEmitter<ServerRuntime | undefined>();
   readonly onDidChange = this.onDidChangeEmitter.event;
 
@@ -35,14 +36,29 @@ export class ServerManager {
   }
 
   async start(env: Record<string, string>, cwd?: string): Promise<ServerRuntime> {
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+
+    this.startPromise = this.startInternal(env, cwd);
+    try {
+      return await this.startPromise;
+    } finally {
+      this.startPromise = undefined;
+    }
+  }
+
+  private async startInternal(env: Record<string, string>, cwd?: string): Promise<ServerRuntime> {
     if (this.child) {
-      if (await this.waitForHealthy(this.port)) {
+      if (this.child && (await this.probe(this.port))) {
         return { baseUrl: `http://127.0.0.1:${this.port}`, port: this.port };
       }
-      return this.restart(env, cwd);
+      await this.stop();
     }
 
     const command = await this.resolver.resolveCommandPath();
+    await this.validateCommandPath(command);
+
     this.port = this.context.globalState.get<number>("waggle.httpPort", 18765);
     const args = ["edit-graph", "--host", "127.0.0.1", "--port", String(this.port), "--no-open"];
     this.log(`Starting ${command} ${args.join(" ")}`);
@@ -50,9 +66,13 @@ export class ServerManager {
     const child = await this.spawnManagedProcess(command, args, env, cwd);
     this.child = child;
 
-    const healthy = await this.waitForHealthy(this.port, 60_000);
+    const healthy = await this.waitForHealthy(this.port, child, 60_000);
     if (!healthy) {
       await this.stop();
+      const exitCode = child.exitCode;
+      if (exitCode !== null && exitCode !== 0) {
+        throw new Error(`Waggle server exited before becoming healthy (code ${exitCode})`);
+      }
       throw new Error(`Waggle server did not become healthy on port ${this.port}`);
     }
 
@@ -84,6 +104,12 @@ export class ServerManager {
     this.onDidChangeEmitter.fire(undefined);
   }
 
+  private async validateCommandPath(command: string): Promise<void> {
+    if (path.isAbsolute(command) || command.includes(path.sep) || command.includes("/")) {
+      await fs.access(command);
+    }
+  }
+
   private spawnManagedProcess(
     command: string,
     args: string[],
@@ -91,6 +117,15 @@ export class ServerManager {
     cwd?: string
   ): Promise<ChildProcess> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (handler: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        handler();
+      };
+
       const child = spawn(command, args, {
         cwd,
         env: { ...process.env, ...env },
@@ -102,12 +137,16 @@ export class ServerManager {
       child.stdout?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
       child.stderr?.on("data", (chunk) => this.log(String(chunk).trimEnd()));
 
-      child.on("error", (error) => {
+      child.once("spawn", () => {
+        finish(() => resolve(child));
+      });
+
+      child.once("error", (error) => {
         if (this.child === child) {
           this.child = undefined;
           this.onDidChangeEmitter.fire(undefined);
         }
-        reject(new Error(`Failed to start Waggle server (${command}): ${error.message}`));
+        finish(() => reject(new Error(`Failed to start Waggle server (${command}): ${error.message}`)));
       });
 
       child.on("exit", (code) => {
@@ -117,8 +156,6 @@ export class ServerManager {
           this.onDidChangeEmitter.fire(undefined);
         }
       });
-
-      resolve(child);
     });
   }
 
@@ -148,9 +185,12 @@ export class ServerManager {
     });
   }
 
-  private async waitForHealthy(port: number, timeoutMs = 30_000): Promise<boolean> {
+  private async waitForHealthy(port: number, child: ChildProcess, timeoutMs = 30_000): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (child.exitCode !== null && child.exitCode !== 0) {
+        return false;
+      }
       if (await this.probe(port)) {
         return true;
       }
