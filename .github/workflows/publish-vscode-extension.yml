@@ -51,6 +51,7 @@ jobs:
       - name: Publish to Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          WAGGLE_RELEASE_REPO: Abhigyan-Shekhar/Waggle-mcp
         run: |
           if [ -z "$VSCE_PAT" ]; then
             echo "::notice::VSCE_PAT not set; skipping marketplace publish."
