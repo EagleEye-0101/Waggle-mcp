@@ -65,9 +65,9 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
 
   const runDoctorInternal = async (showSuccessMessage = true): Promise<boolean> => {
     showOutput();
-    const cmd = await commandPath();
-    ctx.append(`Running: ${cmd} doctor`);
     try {
+      const cmd = await commandPath();
+      ctx.append(`Running: ${cmd} doctor`);
       const result = await execFileAsync(cmd, ["doctor"], {
         cwd: ctx.workspaceFolder()?.uri.fsPath,
         env: { ...process.env, ...ctx.serverEnv() }
@@ -97,7 +97,12 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
       showOutput();
       try {
         await ctx.resolver.ensureBinary();
-        await updateStatusFromEnvironment();
+        const available = await updateStatusFromEnvironment();
+        if (!available) {
+          ctx.setStatus("error", "binary unusable");
+          void vscode.window.showErrorMessage("Waggle binary was downloaded but could not be run. See the output channel.");
+          return false;
+        }
         if (showPostInstallMessage) {
           void vscode.window.showInformationMessage("Waggle binary is ready.");
         }
@@ -123,7 +128,12 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
         return false;
       }
       ctx.append("Waggle installed successfully.");
-      await updateStatusFromEnvironment();
+      const available = await updateStatusFromEnvironment();
+      if (!available) {
+        ctx.setStatus("error", "install unusable");
+        void vscode.window.showErrorMessage("Waggle was installed but the CLI is not runnable. See the output channel.");
+        return false;
+      }
       if (showPostInstallMessage) {
         void vscode.window.showInformationMessage("Waggle installed successfully.");
       }
@@ -304,9 +314,9 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
     }
 
     showOutput();
-    const cmd = await commandPath();
-    ctx.append(`Running: ${cmd} export --output ${target.fsPath}`);
     try {
+      const cmd = await commandPath();
+      ctx.append(`Running: ${cmd} export --output ${target.fsPath}`);
       const result = await execFileAsync(cmd, ["export", "--output", target.fsPath], {
         cwd: folder?.uri.fsPath,
         env: { ...process.env, ...ctx.serverEnv() }
