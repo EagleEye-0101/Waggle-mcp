@@ -123,13 +123,21 @@ jobs:
           fi
           echo "value=${REF#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: waggle-mcp-*
+          merge-multiple: true
+
       - name: Generate bundle-metadata.json
         env:
           BUNDLE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           node apps/vscode-extension/scripts/generate-bundle-metadata.mjs \
             "$BUNDLE_VERSION" \
-            dist/bundle-metadata.json
+            dist/bundle-metadata.json \
+            artifacts
 
       - name: Upload bundle-metadata artifact
         uses: actions/upload-artifact@v4
