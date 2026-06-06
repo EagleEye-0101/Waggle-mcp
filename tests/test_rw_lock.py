@@ -26,7 +26,7 @@ import pytest
 from waggle.graph import _ReadWriteLock
 
 
-def _start(fn, *, daemon: bool = True) -> threading.Thread:
+def _start(fn, *, daemon: bool = False) -> threading.Thread:
     """Start *fn* in a thread and return it (exceptions are re-raised on join)."""
     exc_box: list[BaseException] = []
 
@@ -64,7 +64,6 @@ class TestWriteLock:
                 log.append(f"{label}_out")
 
         a_inside = threading.Event()
-        _orig_worker = worker
 
         def worker_a(label: str, hold: float) -> None:
             with lock:
@@ -74,10 +73,10 @@ class TestWriteLock:
                 log.append(f"{label}_out")
 
         t1 = _start(lambda: worker_a("A", 0.05))
-        a_inside.wait(timeout=2)
+        assert a_inside.wait(timeout=2), "thread_a never entered the lock"
         t2 = _start(lambda: worker("B", 0.05))
-        t1.join(timeout=3)
-        t2.join(timeout=3)
+        _join(t1)
+        _join(t2)
 
         assert log == ["A_in", "A_out", "B_in", "B_out"]
 
@@ -103,7 +102,7 @@ class TestWriteLock:
         assert not acquired.is_set(), "Waiter should still be blocked"
         lock._release_write()
         assert acquired.wait(timeout=2), "Waiter never acquired the lock"
-        t.join(timeout=2)
+        _join(t)
 
     def test_release_by_non_owner_raises(self):
         """Releasing a write lock you don't own must raise RuntimeError."""
@@ -118,7 +117,7 @@ class TestWriteLock:
                 error.append(exc)
 
         t = _start(bad_release)
-        t.join(timeout=2)
+        _join(t)
         assert len(error) == 1
         lock._release_write()  # clean up
 
@@ -138,7 +137,7 @@ class TestReadLock:
 
         threads = [_start(reader) for _ in range(4)]
         for t in threads:
-            t.join(timeout=3)
+            _join(t, timeout=3)
 
         assert sum(inside) == 0
 
@@ -158,7 +157,7 @@ class TestReadLock:
         assert not read_acquired.is_set(), "Reader should be blocked by writer"
         lock._release_write()
         assert read_acquired.wait(timeout=2), "Reader never unblocked"
-        t.join(timeout=2)
+        _join(t)
 
     def test_writer_blocked_by_readers(self):
         """A writer must wait until all active readers have released."""
@@ -183,8 +182,8 @@ class TestReadLock:
         release_readers.set()
         assert write_acquired.wait(timeout=2), "Writer never unblocked"
         for t in readers:
-            t.join(timeout=2)
-        wt.join(timeout=2)
+            _join(t)
+        _join(wt)
 
     def test_reentrant_reads_same_thread(self):
         """A thread may acquire the read lock multiple times."""
@@ -204,7 +203,7 @@ class TestReadLock:
                 error.append(exc)
 
         t = _start(bad_release)
-        t.join(timeout=2)
+        _join(t)
         assert len(error) == 1
 
 
@@ -250,9 +249,8 @@ class TestIssue67:
                     outcome.append(f"raised:{exc}")
 
         t = _start(workload)
-        t.join(timeout=2)
+        _join(t)
 
-        assert not t.is_alive(), "Thread is still hanging — deadlock not fixed"
         assert len(outcome) == 1
         assert outcome[0].startswith("raised:"), f"Expected RuntimeError, got: {outcome[0]!r}"
 
@@ -295,7 +293,7 @@ class TestIssue67:
                     pass
 
         t = _start(bad_thread)
-        t.join(timeout=2)
+        _join(t)
 
         result: list[str] = []
 
@@ -304,7 +302,7 @@ class TestIssue67:
                 result.append("ok")
 
         t2 = _start(good_writer)
-        t2.join(timeout=2)
+        _join(t2)
         assert result == ["ok"]
 
     def test_read_depth_cleaned_up_after_normal_exit(self):
@@ -357,8 +355,8 @@ class TestIssue67:
         tb = _start(thread_b)
         assert b_read_ok.wait(timeout=2), "Thread B could not acquire read lock"
 
-        ta.join(timeout=2)
-        tb.join(timeout=2)
+        _join(ta)
+        _join(tb)
 
     def test_reentrant_read_bypasses_waiting_writer(self):
         """
