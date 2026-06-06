@@ -4,8 +4,9 @@ import { execFileAsync } from "./exec";
 import { BinaryResolver } from "./binary-resolver";
 import { ServerManager } from "./server-manager";
 import { resolveTenantId, writeWorkspaceMcpConfig } from "./mcp-config";
+import { getTrustedSetting, isWorkspaceTrusted, requireWorkspaceTrust } from "./trusted-config";
 
-export type WaggleStatus = "not-installed" | "ready" | "connected" | "error";
+export type WaggleStatus = "not-installed" | "ready" | "connected" | "error" | "restricted";
 
 export interface WaggleContext {
   output: vscode.OutputChannel;
@@ -19,7 +20,9 @@ export interface WaggleContext {
   serverEnv: () => Record<string, string>;
 }
 
-export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.Disposable[]): void {
+export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.Disposable[]): {
+  refreshAfterTrust: () => Promise<void>;
+} {
   const commandPath = async (): Promise<string> => ctx.resolver.resolveCommandPath();
 
   const showOutput = (): void => ctx.output.show(true);
@@ -52,6 +55,12 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
   };
 
   const ensureServer = async (): Promise<string> => {
+    if (!isWorkspaceTrusted()) {
+      if (!(await requireWorkspaceTrust("start the Waggle server"))) {
+        ctx.setStatus("restricted");
+        throw new Error("Waggle server start blocked in untrusted workspace.");
+      }
+    }
     const runtime = ctx.serverManager.runtime;
     if (runtime) {
       return runtime.baseUrl;
@@ -92,7 +101,13 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
   };
 
   const installWaggle = async (showPostInstallMessage = true): Promise<boolean> => {
-    const method = ctx.config().get<string>("installMethod", "binary");
+    if (!isWorkspaceTrusted()) {
+      if (!(await requireWorkspaceTrust("download or install Waggle"))) {
+        ctx.setStatus("restricted");
+        return false;
+      }
+    }
+    const method = getTrustedSetting<string>("installMethod", "binary");
     if (method === "binary") {
       showOutput();
       try {
@@ -164,6 +179,12 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
   };
 
   const onboardWaggle = async (): Promise<void> => {
+    if (!isWorkspaceTrusted()) {
+      if (!(await requireWorkspaceTrust("set up Waggle"))) {
+        ctx.setStatus("restricted");
+        return;
+      }
+    }
     const folder = ctx.workspaceFolder();
     if (!folder) {
       void vscode.window.showWarningMessage("Open a workspace folder before running Waggle setup.");
@@ -179,7 +200,7 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
       return;
     }
 
-    const method = ctx.config().get<string>("installMethod", "binary");
+    const method = getTrustedSetting<string>("installMethod", "binary");
     if (method === "binary") {
       const installed = await installWaggle(false);
       if (!installed) {
@@ -352,6 +373,10 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
   };
 
   const tryAutoStartServer = async (): Promise<void> => {
+    if (!isWorkspaceTrusted()) {
+      ctx.setStatus("restricted");
+      return;
+    }
     if (!ctx.config().get<boolean>("autoStart", true) || !ctx.workspaceFolder()) {
       return;
     }
@@ -363,6 +388,10 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
   };
 
   const maybePromptInstall = async (): Promise<void> => {
+    if (!isWorkspaceTrusted()) {
+      ctx.setStatus("restricted");
+      return;
+    }
     let available = await updateStatusFromEnvironment();
 
     await tryAutoStartServer();
@@ -398,5 +427,11 @@ export function registerWaggleCommands(ctx: WaggleContext, disposables: vscode.D
     vscode.commands.registerCommand("waggle.observeConversation", observeConversation)
   );
 
-  void maybePromptInstall();
+  if (!isWorkspaceTrusted()) {
+    ctx.setStatus("restricted");
+  } else {
+    void maybePromptInstall();
+  }
+
+  return { refreshAfterTrust: maybePromptInstall };
 }

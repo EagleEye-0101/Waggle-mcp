@@ -4,6 +4,7 @@ import * as http from "http";
 import * as path from "path";
 import * as vscode from "vscode";
 import { BinaryResolver } from "./binary-resolver";
+import { curatedSpawnEnv, spawnNotFoundMessage } from "./spawn-env";
 
 export interface ServerRuntime {
   baseUrl: string;
@@ -36,6 +37,9 @@ export class ServerManager {
   }
 
   async start(env: Record<string, string>, cwd?: string): Promise<ServerRuntime> {
+    if (!vscode.workspace.isTrusted) {
+      throw new Error("Cannot start Waggle server in an untrusted workspace. Trust this folder first.");
+    }
     if (this.startPromise) {
       return this.startPromise;
     }
@@ -128,7 +132,7 @@ export class ServerManager {
 
       const child = spawn(command, args, {
         cwd,
-        env: { ...process.env, ...env },
+        env: curatedSpawnEnv(env),
         detached: false,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true
@@ -146,7 +150,12 @@ export class ServerManager {
           this.child = undefined;
           this.onDidChangeEmitter.fire(undefined);
         }
-        finish(() => reject(new Error(`Failed to start Waggle server (${command}): ${error.message}`)));
+        finish(() => {
+          const message = error.message.includes("ENOENT")
+            ? spawnNotFoundMessage(command)
+            : `Failed to start Waggle server (${command}): ${error.message}`;
+          reject(new Error(message));
+        });
       });
 
       child.on("exit", (code) => {

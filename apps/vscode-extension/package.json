@@ -20,6 +20,12 @@
   "engines": {
     "vscode": "^1.96.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Waggle will not download binaries or start servers until this workspace is trusted."
+    }
+  },
   "categories": [
     "AI",
     "Other"

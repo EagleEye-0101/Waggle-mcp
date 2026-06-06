@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { curatedSpawnEnv } from "./spawn-env";
 
 const MCP_TIMEOUT_MS = 30_000;
 
@@ -31,7 +32,7 @@ export async function callStdioTool(
   const transport = new StdioClientTransport({
     command,
     args: ["serve", "--transport", "stdio"],
-    env: { ...process.env, ...env } as Record<string, string>,
+    env: curatedSpawnEnv(env),
     stderr: "pipe"
   });
   const client = new Client({ name: "waggle-vscode", version: "1.0.0" }, { capabilities: {} });

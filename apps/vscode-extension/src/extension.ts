@@ -4,6 +4,7 @@ import { registerWaggleCommands, type WaggleStatus } from "./commands";
 import { ServerManager } from "./server-manager";
 import { resolveTenantId } from "./mcp-config";
 import { GraphStudioViewProvider } from "./graph-studio-view";
+import { isWorkspaceTrusted } from "./trusted-config";
 
 const OUTPUT_CHANNEL = "Waggle";
 const DEFAULT_DB_PATH = "~/.waggle/waggle.db";
@@ -28,7 +29,8 @@ export function activate(context: vscode.ExtensionContext): void {
       "not-installed": `Waggle: Not Installed${suffix}`,
       ready: `Waggle: Ready${suffix}`,
       connected: `Waggle: Connected${suffix}`,
-      error: `Waggle: Error${suffix}`
+      error: `Waggle: Error${suffix}`,
+      restricted: `Waggle: Restricted (untrusted workspace)${suffix}`
     };
     statusBar.text = labels[status];
     statusBar.show();
@@ -57,7 +59,7 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => void serverManager.stop() }
   );
 
-  registerWaggleCommands(
+  const waggleCommands = registerWaggleCommands(
     {
       output,
       statusBar,
@@ -70,6 +72,14 @@ export function activate(context: vscode.ExtensionContext): void {
       serverEnv
     },
     context.subscriptions
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      if (isWorkspaceTrusted()) {
+        void waggleCommands.refreshAfterTrust();
+      }
+    })
   );
 }
 
