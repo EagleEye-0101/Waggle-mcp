@@ -2094,3 +2094,20 @@ class TestHookToolsFromArgs:
         # A client that has config support but no hooks (e.g. cursor) is rejected.
         with pytest.raises(ValidationFailure):
             _hook_tools_from_args("cursor", no_hooks=False)
+
+    def test_dry_run_validates_hooks(self):
+        # Regression for CodeRabbit review: invalid --hooks must be caught
+        # even in dry-run mode (validation happens before the early return).
+        args = SimpleNamespace(
+            yes=True,
+            dry_run=True,
+            db="",
+            model="all-MiniLM-L6-v2",
+            clients="codex",
+            hooks="bogus",
+            no_hooks=False,
+            project_instructions=False,
+            run_doctor=False,
+        )
+        with pytest.raises(ValidationFailure):
+            _run_setup(args)

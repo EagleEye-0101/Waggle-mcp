@@ -6182,6 +6182,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     db_path = str(Path(db_path_raw).expanduser().resolve())
     python_exe = _python_exe()
     clients = _setup_clients_from_args(args.clients)
+    hook_tools = _hook_tools_from_args(getattr(args, "hooks", "auto"), bool(getattr(args, "no_hooks", False)))
 
     print()
     print(_c(_BOLD, "waggle-mcp setup"))
@@ -6193,6 +6194,9 @@ def _run_setup(args: argparse.Namespace) -> int:
         print("  mode: dry-run")
         for client in clients:
             _ok(f"Would configure {client}")
+        if "Claude Code" in hook_tools:
+            hooks_path = _find_claude_settings()
+            _ok(f"Would install Claude Code hooks in {hooks_path}")
         if args.project_instructions and "Codex" in clients:
             agents_path = (Path.cwd() / "AGENTS.md").resolve()
             _ok(f"Would write Codex automatic-memory instructions to {agents_path}")
@@ -6230,7 +6234,6 @@ def _run_setup(args: argparse.Namespace) -> int:
     print()
 
     # Install automatic memory hooks for the selected hook-capable tools
-    hook_tools = _hook_tools_from_args(getattr(args, "hooks", "auto"), bool(getattr(args, "no_hooks", False)))
     if hook_tools and not args.dry_run:
         if "Claude Code" in hook_tools:
             hook_dir = Path(__file__).resolve().parent / "hooks" / "claude_code"
